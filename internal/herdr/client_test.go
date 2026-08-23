@@ -42,6 +42,31 @@ printf '%s\n' '{"result":{"workspace":{"workspace_id":"w7"}}}'
 	}
 }
 
+func TestRunParsesStructuredErrorFromStderrBeforePlainFallback(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "fake-herdr")
+	script := `#!/bin/sh
+case "$1" in
+  structured)
+    printf '%s\n' '{"error":{"code":"timeout","message":"wait expired"}}' >&2
+    ;;
+  plain)
+    printf '%s\n' 'plain stderr failure' >&2
+    ;;
+esac
+exit 1
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	client := &CLI{Bin: bin}
+	if err := client.run(context.Background(), nil, "structured"); !hasCode(err, "timeout") || err.Error() != "timeout: wait expired" {
+		t.Fatalf("structured stderr err=%v", err)
+	}
+	if err := client.run(context.Background(), nil, "plain"); err == nil || hasCode(err, "timeout") || err.Error() != "plain stderr failure" {
+		t.Fatalf("plain stderr err=%v", err)
+	}
+}
+
 func TestStatusMapsMissingAgentToGone(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "fake-herdr")
 	script := `#!/bin/sh
@@ -227,6 +252,51 @@ esac
 		t.Fatal(err)
 	}
 	if string(waitRaw) != "1" {
+		t.Fatalf("wait calls=%q", waitRaw)
+	}
+}
+
+func TestWaitRetriesTimeoutEnvelopeFromStderr(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "herdr")
+	waitCountPath := filepath.Join(dir, "wait-count")
+	script := `#!/bin/sh
+set -eu
+case "$1 $2" in
+  "agent wait")
+    count=0
+    [ ! -e "$HERDR_WAIT_COUNT" ] || count=$(cat "$HERDR_WAIT_COUNT")
+    count=$((count + 1))
+    printf '%s' "$count" > "$HERDR_WAIT_COUNT"
+    if [ "$count" -eq 1 ]; then
+      printf '%s\n' '{"error":{"code":"timeout","message":"timed out waiting for agent"}}' >&2
+      exit 1
+    fi
+    printf '%s\n' '{"result":{}}'
+    ;;
+  "agent get")
+    printf '%s\n' '{"result":{"agent":{"agent_status":"done","state_change_seq":12}}}'
+    ;;
+  *)
+    exit 22
+    ;;
+esac
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_WAIT_COUNT", waitCountPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := (&CLI{Bin: bin}).Wait(ctx, "p1", 5*time.Second)
+	if err != nil || status != "done" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+	waitRaw, err := os.ReadFile(waitCountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(waitRaw) != "2" {
 		t.Fatalf("wait calls=%q", waitRaw)
 	}
 }

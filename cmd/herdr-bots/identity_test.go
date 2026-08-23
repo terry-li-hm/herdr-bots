@@ -105,7 +105,7 @@ func TestReleaseManifestPointsAtSourceLauncher(t *testing.T) {
 	manifest := string(raw)
 	for _, want := range []string{
 		`id = "terry.herdr-bots"`,
-		`version = "0.1.0"`,
+		`version = "0.1.1"`,
 		`command = ["./herdr-bots", "pane"]`,
 	} {
 		if !strings.Contains(manifest, want) {

@@ -58,17 +58,26 @@ func hasCode(err error, code string) bool {
 	return errors.As(err, &target) && target.Code == code
 }
 
+func parseAPIError(raw []byte) *apiError {
+	var envelope struct {
+		Error struct{ Code, Message string } `json:"error"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil || (envelope.Error.Code == "" && envelope.Error.Message == "") {
+		return nil
+	}
+	return &apiError{Code: envelope.Error.Code, Message: envelope.Error.Message}
+}
+
 func (c *CLI) run(ctx context.Context, out any, args ...string) error {
 	cmd := exec.CommandContext(ctx, c.Bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		var envelope struct {
-			Error struct{ Code, Message string } `json:"error"`
-		}
-		if json.Unmarshal(stdout.Bytes(), &envelope) == nil && (envelope.Error.Code != "" || envelope.Error.Message != "") {
-			return &apiError{Code: envelope.Error.Code, Message: envelope.Error.Message}
+		for _, raw := range [][]byte{stdout.Bytes(), stderr.Bytes()} {
+			if apiErr := parseAPIError(raw); apiErr != nil {
+				return apiErr
+			}
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {

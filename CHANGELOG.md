@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
+## [0.1.1] - 2026-08-24
+
+### Fixed
+
+- Real Herdr emits structured error envelopes on stderr; parse them as well as
+  stdout so transient agent-wait timeouts are recognized and retried.
+
 ## [0.1.0] - 2026-08-24
 
 First public preview of Herdr Bots: a durable, local, macOS scheduler for
@@ -49,4 +56,5 @@ Derived implementation patterns from the MIT-licensed
 `DnzzL/herdr-automations` project at commit `08640f3` by Thomas Legrand;
 this implementation is separately maintained by Terry Li. See `NOTICE`.
 
+[0.1.1]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1
 [0.1.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.0

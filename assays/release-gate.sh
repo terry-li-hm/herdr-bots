@@ -65,14 +65,14 @@ grep -q '^module github.com/terry-li-hm/herdr-bots$' "$root/go.mod" || \
     fail 'go.mod module must be github.com/terry-li-hm/herdr-bots'
 grep -q '^id = "terry.herdr-bots"$' "$root/herdr-plugin.toml" || \
     fail 'plugin id must be terry.herdr-bots'
-grep -q '^version = "0.1.0"$' "$root/herdr-plugin.toml" || \
-    fail 'plugin manifest version must be 0.1.0'
+grep -q '^version = "0.1.1"$' "$root/herdr-plugin.toml" || \
+    fail 'plugin manifest version must be 0.1.1'
 grep -q 'const Label = "com.terry.herdr-bots"' "$root/internal/service/launchd.go" || \
     fail 'launchd service label must be com.terry.herdr-bots'
 grep -q -- '-o bin/herdr-bots ./cmd/herdr-bots' "$root/Makefile" || \
     fail 'Makefile build target must produce bin/herdr-bots'
-grep -q '^## \[0.1.0\]' "$root/CHANGELOG.md" || \
-    fail 'CHANGELOG.md must carry the 0.1.0 entry'
+grep -q '^## \[0.1.1\] - 2026-08-24$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG.md must carry the dated 0.1.1 entry'
 note 'module, CLI, plugin, and service identities agree'
 
 # 4. Examples ship disabled.
@@ -90,8 +90,10 @@ note "example jobs disabled ($job_count/$job_count)"
 # 4b. Corrected publication contracts.
 grep -q 'https://github.com/herdrdev/herdr' "$root/README.md" || \
     fail 'README must point the Herdr prerequisite at github.com/herdrdev/herdr'
-grep -q 'go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.1.0' "$root/README.md" || \
-    fail 'README must document the pinned go install path for the shell CLI'
+grep -q 'go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.1.1' "$root/README.md" || \
+    fail 'README must document the current pinned go install path for the shell CLI'
+grep -q 'herdr plugin install terry-li-hm/herdr-bots --ref v0.1.1' "$root/README.md" || \
+    fail 'README must document the current pinned plugin install ref'
 grep -q 'herdr plugin uninstall terry.herdr-bots' "$root/README.md" || \
     fail 'README must use the exact current uninstall command'
 grep -q 'may fetch Go modules' "$root/README.md" || \
@@ -105,8 +107,14 @@ grep -q 'reported by Pi' "$root/AGENTS.md" || \
     fail 'AGENTS.md must state non-Claude routes are configured/reported by Pi'
 grep -q 'actual release date' "$root/docs/release.md" || \
     fail 'docs/release.md must require setting the actual release date before tag/release'
-grep -q '^## \[0.1.0\]' "$root/CHANGELOG.md" || \
-    fail 'CHANGELOG must carry the 0.1.0 section'
+grep -q '^## \[0.1.1\] - 2026-08-24$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must carry the dated 0.1.1 section'
+grep -q '^\[0.1.1\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must carry the current 0.1.1 release link'
+grep -q '^## \[0.1.0\] - 2026-08-24$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must preserve the historical dated 0.1.0 section'
+grep -q '^\[0.1.0\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.0$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must preserve the historical 0.1.0 release link'
 grep -qx 'Copyright (c) 2026 Thomas Legrand' "$root/LICENSE" || \
     fail 'LICENSE must keep the original MIT copyright as a separate unannotated line'
 grep -qx 'Copyright (c) 2026 Terry Li' "$root/LICENSE" || \

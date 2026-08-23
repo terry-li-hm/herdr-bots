@@ -7,7 +7,7 @@ inbox. Claude runs stay native to Claude Code; non-Claude routes configured and
 reported by Pi stay native to Pi. launchd supervises the scheduler. Nothing
 runs, installs, or schedules merely because this code exists on disk.
 
-**Status: v0.1.0 preview.** The scheduler lifecycle and its safety contract
+**Status: v0.1.1 preview.** The scheduler lifecycle and its safety contract
 are complete and tested, but the project is young and the surface will
 change. macOS is the only supported build, test, plugin, and managed-service
 target. The engine uses macOS-only atomic filesystem primitives and does not
@@ -29,7 +29,7 @@ currently compile on Linux.
 ### Herdr plugin (pane surface)
 
 ```bash
-herdr plugin install terry-li-hm/herdr-bots --ref v0.1.0
+herdr plugin install terry-li-hm/herdr-bots --ref v0.1.1
 ```
 
 The plugin install provides the pane surface: the read-oriented run inbox.
@@ -66,7 +66,7 @@ rest) and the launchd service are not provided by the plugin install;
 install the CLI binary separately:
 
 ```bash
-go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.1.0
+go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.1.1
 ```
 
 Put the directory `go install` writes to on `PATH`. Find it with `go env
@@ -293,7 +293,7 @@ above, and the worktrees listed in `herdr-bots runs`/`show` output yourself.
 Clock schedules (cron, once) and typed local event intake only. No remote
 APIs, webhooks, event payloads, persistent conversation memory, workflow
 graphs, cloud execution, multi-repository jobs, systemd support, or model
-fallback — all deliberate v0.1.0 exclusions. `min_herdr_version` is asserted
+fallback — all deliberate v0.1.x exclusions. `min_herdr_version` is asserted
 in the manifest but not re-checked by the CLI at runtime. Report security
 issues through [SECURITY.md](SECURITY.md).
 
