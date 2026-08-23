@@ -10,18 +10,13 @@ permissions:
   contents: read
 
 jobs:
-  # macOS is the supported plugin target (launchd, Herdr, perl supervisor).
-  # Ubuntu is portability evidence only; no managed service is claimed there.
+  # The implementation uses macOS-only filesystem primitives and launchd.
   check:
-    name: make check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    name: make check (macOS)
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Run the full deterministic gate

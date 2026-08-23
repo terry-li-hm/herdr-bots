@@ -6,8 +6,9 @@ be accepted even when they are convenient.
 
 ## Prerequisites
 
-- macOS for the full plugin surface (launchd service, Herdr integration).
-  Linux works for builds and tests as portability evidence only.
+- macOS for builds, tests, launchd service code, and Herdr integration. The
+  engine uses macOS-only atomic filesystem primitives and does not currently
+  compile on Linux.
 - Go matching the version in `go.mod`.
 - Git.
 - Herdr 0.8.0+ for any change touching workspaces, panes, or agents.

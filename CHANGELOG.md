@@ -39,7 +39,9 @@ and an evidence-backed read inbox.
 - Config authority admission: only regular, non-symlink, mode-`0600` files
   whose opened inode matches the path are accepted.
 - Public release artefacts: README, SECURITY.md, CONTRIBUTING.md, NOTICE,
-  release gate (`assays/release-gate.sh`), and CI on macOS and Ubuntu.
+  release gate (`assays/release-gate.sh`), and read-only macOS CI running
+  `make check`. Linux is not claimed as a build or test target because the
+  engine depends on macOS-only atomic filesystem primitives.
 
 ### Attribution
 

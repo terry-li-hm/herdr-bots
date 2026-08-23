@@ -9,8 +9,9 @@ runs, installs, or schedules merely because this code exists on disk.
 
 **Status: v0.1.0 preview.** The scheduler lifecycle and its safety contract
 are complete and tested, but the project is young and the surface will
-change. macOS is the only supported plugin target. Linux is a build and test
-platform only, not an advertised managed-service target.
+change. macOS is the only supported build, test, plugin, and managed-service
+target. The engine uses macOS-only atomic filesystem primitives and does not
+currently compile on Linux.
 
 ## Prerequisites
 
