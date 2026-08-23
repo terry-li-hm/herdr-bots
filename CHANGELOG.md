@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-08-24
 
 First public preview of Herdr Bots: a durable, local, macOS scheduler for
 coding-agent jobs with pinned native-harness routes, isolated worktree runs,
