@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Read-only: CI only verifies; it never publishes, tags, or installs.
+permissions:
+  contents: read
+
+jobs:
+  # macOS is the supported plugin target (launchd, Herdr, perl supervisor).
+  # Ubuntu is portability evidence only; no managed service is claimed there.
+  check:
+    name: make check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run the full deterministic gate
+        run: make check

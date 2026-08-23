@@ -1,0 +1,19 @@
+id = "terry.herdr-bots"
+name = "Herdr Bots"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Local scheduled bots with pinned routes, isolated runs, and an evidence-backed inbox."
+platforms = ["macos"]
+
+[[panes]]
+id = "inbox"
+title = "Bots"
+placement = "overlay"
+command = ["./herdr-bots", "pane"]
+
+# The pane command uses the root source launcher, which compiles into an
+# owner-private cache on first use, so the checkout needs no built bin/.
+#
+# Deliberately no [[startup]] hook. Herdr startup hooks are one-shot and do
+# not supervise permanent daemons. Render the reviewed launchd service with:
+# herdr-bots service render

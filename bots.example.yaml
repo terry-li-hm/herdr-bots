@@ -1,0 +1,97 @@
+# Herdr Bots example job definitions.
+#
+# Every job below is DISABLED. Review each field, point `repository` at an
+# absolute path you control, and enable a job only after `herdr-bots doctor`
+# passes for it.
+#
+# Route values are EXAMPLES, not recommendations. Provider and model strings
+# must be selected from what your native harness actually reports: run
+# `pi --list-models PROVIDER` for Pi routes, or check your Claude Code
+# subscription for Claude routes. A route your harness does not report fails
+# closed at probe time; there is no fallback.
+#
+# Keep this file at mode 0600 once copied. The job definition is executable
+# authority: verifier commands are arbitrary saved local commands, and the
+# scheduler will run them in the run workspace as your user.
+version: 1
+capacity:
+  max_concurrent_runs: 2
+  min_free_disk_gib: 3
+jobs:
+  - id: docs-drift
+    revision: 1
+    enabled: false
+    schedule:
+      kind: cron
+      expression: "0 9 * * 1"
+      timezone: Asia/Hong_Kong
+      catch_up_grace_minutes: 120
+    execution:
+      repository: /absolute/path/to/repository
+      workspace: worktree
+      base_ref: main
+      harness: pi
+      provider: openai-codex        # example value; use a route your pi reports
+      model: gpt-5.6-sol            # example value; use a model your pi reports
+      thinking: high
+      permission_profile: read-only-no-network
+    run_if_changed: true
+    prompt: |
+      Compare merged code changes with documentation and report any drift.
+      Do not edit files.
+    timeout_minutes: 45
+    overlap: forbid
+    verifier:
+      command: ["git", "diff", "--check"]
+    limits:
+      max_runs_per_day: 1
+      disk_reserve_gib: 1.25
+
+  - id: local-repair-event
+    revision: 1
+    enabled: false
+    schedule:
+      kind: event
+      timezone: Asia/Hong_Kong
+    execution:
+      repository: /absolute/path/to/repository
+      workspace: worktree
+      harness: pi
+      provider: openai-codex        # example value; use a route your pi reports
+      model: gpt-5.6-sol            # example value; use a model your pi reports
+      thinking: high
+      permission_profile: repo-write-no-network
+    prompt: |
+      Use only this saved job definition as authority.
+      Produce a local tested candidate. Do not push, merge, install, or send.
+    timeout_minutes: 60
+    overlap: forbid
+    verifier:
+      command: ["git", "diff", "--check"]
+    limits:
+      max_runs_per_day: 1
+      disk_reserve_gib: 1.25
+
+  - id: one-off-review
+    revision: 1
+    enabled: false
+    schedule:
+      kind: once
+      at: "2026-08-25T09:00:00+08:00"
+      timezone: Asia/Hong_Kong
+      catch_up_grace_minutes: 30
+    execution:
+      repository: /absolute/path/to/repository
+      workspace: worktree
+      harness: claude-code
+      model: opus                   # example value; use a model your subscription reports
+      thinking: high
+      permission_profile: repo-write-no-network
+    prompt: |
+      Review the repository and make only the requested local edits.
+      Do not push, publish, send messages, or use network tools.
+    timeout_minutes: 60
+    overlap: forbid
+    limits:
+      max_runs_per_day: 1
+      disk_reserve_gib: 1.25

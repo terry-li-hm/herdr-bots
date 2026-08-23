@@ -1,0 +1,47 @@
+# Release evidence for Herdr Bots
+
+This document records what a release candidate must prove before the v0.1.0
+tag exists, and which actions stay behind separate explicit gates. It is
+evidence, not authority: no step here publishes anything.
+
+## Evidence matrix
+
+| # | Requirement | Evidence | Owner of the check |
+|---|---|---|---|
+| 1 | Full static and test gate | `make check` passes (module verify, gofmt check without rewriting, vet, race-enabled tests, full build, shell syntax, behavioral launcher assay, release gate) | `make check` |
+| 2 | No whitespace damage | `git diff --check` is clean | verifier command |
+| 3 | No secrets in the release tree | `gitleaks dir . --redact=100 --no-banner --no-color` passes | verifier command |
+| 4 | Required public artefacts | README, LICENSE (dual copyright), NOTICE, SECURITY, CONTRIBUTING, CHANGELOG (0.1.0), AGENTS, bots.example.yaml, herdr-plugin.toml, root launcher, docs/release.md, CI workflow all present | `assays/release-gate.sh` |
+| 5 | One coherent public identity | module `github.com/terry-li-hm/herdr-bots`, CLI `cmd/herdr-bots`, plugin id `terry.herdr-bots`, service label `com.terry.herdr-bots`, version `0.1.0` agree everywhere | `assays/release-gate.sh` |
+| 6 | Source-installable plugin | Manifest pane command is `["./herdr-bots", "pane"]`; launcher builds `cmd/herdr-bots` into the private cache and execs it | `assays/release-gate.sh` + `assays/launcher-assay.sh` |
+| 7 | Launcher cache behavior | The executable assay creates its own `mktemp` root and disposable Git fixtures with a fake compiler (so it neither uses the network nor claims a production-toolchain integration test). It covers clean inode reuse, paths with spaces, identical untracked content under distinct names, checked Git failure, source mutation during build, cache symlink/mode rejection, and concurrent first-build convergence. Wrong-owner rejection runs only as root and is explicitly reported as unsupported otherwise; no ownership result is fabricated. | `assays/launcher-assay.sh` |
+| 8 | Service render validity | `./herdr-bots service render` output passes `plutil -lint` with label `com.terry.herdr-bots`; nothing is installed or loaded | verifier command |
+| 9 | Examples ship disabled | Every job in `bots.example.yaml` declares `enabled: false`; example route values are labelled as examples | `assays/release-gate.sh` |
+| 10 | No private/internal identity strings | Tracked tree greps clean for forbidden identity strings; public owner strings (`Terry Li`, `terry-li-hm`, `Thomas Legrand`) remain valid | `assays/release-gate.sh` |
+| 11 | CI evidence | `.github/workflows/ci.yml` runs `make check` on macOS (supported plugin target) and Ubuntu (portability evidence) with read-only permissions and the `go.mod` Go version | workflow definition |
+| 12 | Changelog dating | The CHANGELOG 0.1.0 entry carries the actual release date, not `Unreleased`, in the same commit that will be tagged | release operator |
+| 13 | History hygiene | Publication uses a fresh clean-root repository export; the development history is not pushed as-is | release operator |
+| 14 | Config admission | Go tests cover exact mode, symlink and non-regular rejection; wrong-owner rejection runs only where the test process can create a genuinely different owner. The implementation and public policy pin no-follow/close-on-exec descriptor admission, regular-file/effective-UID/exact-0600 checks, and final path/inode equality. macOS ACLs are not inspected and must not grant others access. | `go test` + code/policy review |
+
+## Separate explicit gates (not performed by this repository's build)
+
+Each of the following is an intentional human action that nothing in `make
+check`, the release gate, or CI performs or authorizes:
+
+1. Creating the public `terry-li-hm/herdr-bots` repository.
+2. Pushing any history or export to it.
+3. Creating and pushing the `v0.1.0` tag.
+4. Publishing the GitHub release.
+5. Changing repository visibility.
+6. Announcing the release anywhere.
+7. Installing, linking, or enabling the plugin on any machine (including the
+   author's), or loading the launchd service.
+
+## Release checklist
+
+1. Confirm every row of the evidence matrix on the exact commit intended for
+   release.
+2. Replace `Unreleased` in the CHANGELOG 0.1.0 entry with the actual release
+   date; the tagged commit must not still say `Unreleased`.
+3. Prepare the fresh clean-root export (no history rewrite in place).
+4. Only then, and as separate decisions, walk the explicit gates above.

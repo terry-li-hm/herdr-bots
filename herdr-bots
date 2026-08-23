@@ -1,0 +1,171 @@
+#!/bin/sh
+# Herdr Bots source launcher: fingerprint this checkout, build into an
+# owner-private cache, and execute the admitted cache entry. It never installs,
+# links, enables, publishes, or touches a service.
+set -eu
+umask 077
+
+self=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+
+die() {
+    printf 'herdr-bots: %s\n' "$*" >&2
+    exit 1
+}
+
+for tool in git go xargs; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is required by the source launcher"
+done
+
+# Use the SHA-256 implementation shipped by macOS or common Linux systems.
+digest_file() {
+    digest_path=$1
+    if command -v shasum >/dev/null 2>&1; then
+        digest_result=$(shasum -a 256 "$digest_path") || return 1
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest_result=$(sha256sum "$digest_path") || return 1
+    else
+        return 1
+    fi
+    printf '%s\n' "${digest_result%% *}"
+}
+
+if [ -n "${HERDR_PLUGIN_STATE_DIR:-}" ]; then
+    cache_dir=$HERDR_PLUGIN_STATE_DIR/bin
+else
+    cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/herdr-bots/bin
+fi
+
+path_mode() {
+    if value=$(stat -c '%a' "$1" 2>/dev/null); then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    stat -f '%Lp' "$1" 2>/dev/null
+}
+
+path_owner() {
+    if value=$(stat -c '%u' "$1" 2>/dev/null); then
+        printf '%s\n' "$value"
+        return 0
+    fi
+    stat -f '%u' "$1" 2>/dev/null
+}
+
+euid=$(id -u) || die 'cannot determine effective uid'
+
+# Missing cache directories are created owner-private. Existing paths are
+# never repaired: they must already be a non-symlink directory, owned by the
+# effective uid, with mode exactly 0700.
+require_cache_dir() {
+    if [ -e "$cache_dir" ] || [ -L "$cache_dir" ]; then
+        [ ! -L "$cache_dir" ] || die "cache directory is a symlink, refusing: $cache_dir"
+        [ -d "$cache_dir" ] || die "cache path is not a directory, refusing: $cache_dir"
+    else
+        mkdir -p -- "$cache_dir" || die "cannot create cache directory: $cache_dir"
+        chmod 700 "$cache_dir" || die "cannot set cache directory mode 0700: $cache_dir"
+    fi
+    [ -d "$cache_dir" ] || die "cache directory missing, refusing: $cache_dir"
+    [ ! -L "$cache_dir" ] || die "cache directory is a symlink, refusing: $cache_dir"
+    [ "$(path_mode "$cache_dir")" = 700 ] || die "cache directory mode is not 0700, refusing: $cache_dir"
+    [ "$(path_owner "$cache_dir")" = "$euid" ] || die "cache directory is not owned by effective uid $euid, refusing: $cache_dir"
+}
+
+# Every executable cache entry, including a concurrent builder's winner, must
+# be a non-symlink regular file owned by the effective uid with mode 0700.
+require_entry() {
+    target=$1
+    [ ! -L "$target" ] || die "cache entry is a symlink, refusing: $target"
+    [ -f "$target" ] || die "cache entry is not a regular file, refusing: $target"
+    [ "$(path_mode "$target")" = 700 ] || die "cache entry mode is not 0700, refusing: $target"
+    [ "$(path_owner "$target")" = "$euid" ] || die "cache entry is not owned by effective uid $euid, refusing: $target"
+    [ -x "$target" ] || die "cache entry is not executable, refusing: $target"
+}
+
+require_cache_dir
+scan_dir=$(mktemp -d "$cache_dir/.herdr-bots-scan.XXXXXX") || die 'cannot create private fingerprint workspace'
+[ "$(path_mode "$scan_dir")" = 700 ] || die 'fingerprint workspace mode is not 0700'
+[ "$(path_owner "$scan_dir")" = "$euid" ] || die 'fingerprint workspace has the wrong owner'
+build_tmp=
+cleanup() {
+    [ -z "$build_tmp" ] || rm -f -- "$build_tmp"
+    rm -rf -- "$scan_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+# snapshot_source writes a byte-preserving source snapshot. Porcelain -z and
+# ls-files -z retain arbitrary filenames (including spaces and newlines), the
+# tracked diff is binary-complete, and the path list is paired with hashes of
+# every nonignored untracked file. Every git failure is checked directly.
+snapshot_source() {
+    prefix=$1
+    git -C "$self" describe --tags --always >"$prefix.revision" || die 'git describe --tags --always failed'
+    [ -s "$prefix.revision" ] || die 'git describe returned an empty revision'
+    git -C "$self" status --porcelain=v1 -z --untracked-files=all >"$prefix.status" || die 'git status failed'
+    git -C "$self" diff --binary --no-ext-diff HEAD -- >"$prefix.diff" || die 'git tracked diff failed'
+    git -C "$self" ls-files --others --exclude-standard -z >"$prefix.untracked-paths" || die 'git untracked-file listing failed'
+    # xargs -0 preserves each pathname as an argument; the separately retained
+    # NUL path stream binds these ordered content hashes to their exact names.
+    xargs -0 git -C "$self" hash-object -- <"$prefix.untracked-paths" >"$prefix.untracked-hashes" || die 'git untracked-content hashing failed'
+    {
+        printf 'status\000'
+        cat "$prefix.status"
+        printf 'tracked-binary-diff\000'
+        cat "$prefix.diff"
+        printf 'untracked-paths\000'
+        cat "$prefix.untracked-paths"
+        printf 'untracked-content-hashes\000'
+        cat "$prefix.untracked-hashes"
+    } >"$prefix.changes-input" || die 'cannot assemble source fingerprint'
+    digest_file "$prefix.changes-input" >"$prefix.changes" || die 'cannot hash source changes'
+    {
+        printf 'revision\000'
+        cat "$prefix.revision"
+        printf 'changes\000'
+        cat "$prefix.changes"
+    } >"$prefix.fingerprint-input" || die 'cannot assemble full source fingerprint'
+    digest_file "$prefix.fingerprint-input" >"$prefix.fingerprint" || die 'cannot hash full source fingerprint'
+}
+
+snapshot_source "$scan_dir/before"
+revision=$(tr -d '\n' <"$scan_dir/before.revision")
+[ -n "$revision" ] || die 'cannot derive source revision'
+if [ -s "$scan_dir/before.status" ]; then
+    changes=$(tr -d '\n' <"$scan_dir/before.changes")
+    [ -n "$changes" ] || die 'cannot derive a dirty-checkout cache key'
+    revision="$revision-dirty-$changes"
+fi
+
+cache_id=$(printf '%s' "$revision" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
+binary=$cache_dir/herdr-bots-$cache_id
+
+if [ -e "$binary" ] || [ -L "$binary" ]; then
+    require_entry "$binary"
+else
+    build_tmp=$(mktemp "$cache_dir/.herdr-bots-build.XXXXXX") || die 'cannot create private build output'
+    (cd -- "$self" && go build -trimpath -ldflags "-X main.version=$revision" -o "$build_tmp" ./cmd/herdr-bots) || die 'go build failed; install a Go toolchain matching go.mod first'
+    chmod 700 "$build_tmp" || die "cannot set built binary mode 0700: $build_tmp"
+    require_entry "$build_tmp"
+
+    # A build is admitted only if its complete source fingerprint still equals
+    # the one selected before compilation.
+    snapshot_source "$scan_dir/after"
+    if ! cmp -s "$scan_dir/before.fingerprint" "$scan_dir/after.fingerprint"; then
+        die 'source changed during build; refusing to publish the result'
+    fi
+
+    # Hard-link publication is atomic and cannot clobber an existing name. If
+    # another builder won, strictly validate and reuse that winner.
+    if ln "$build_tmp" "$binary" 2>/dev/null; then
+        rm -f -- "$build_tmp"
+        build_tmp=
+    elif [ -e "$binary" ] || [ -L "$binary" ]; then
+        require_entry "$binary"
+    else
+        die "cannot publish cache entry without clobbering: $binary"
+    fi
+fi
+
+require_entry "$binary"
+trap - EXIT HUP INT TERM
+cleanup
+exec "$binary" "$@"

@@ -1,0 +1,17 @@
+Herdr Bots
+Copyright (c) 2026 Terry Li
+
+This repository is a separately maintained implementation. Selected
+implementation patterns are derived from the MIT-licensed
+DnzzL/herdr-automations project at commit
+08640f3b3d800e906c6f57c164c4fb80fa9e5f14, Copyright (c) 2026 Thomas Legrand.
+
+The MIT license in LICENSE applies to everything in this repository. The
+original project's copyright and permission notice are preserved there as a
+condition of that license. The original project is not affiliated with this
+repository.
+
+This implementation replaces the original project's unsupervised startup
+lifecycle and append-only scheduling state with a durable SQLite control
+plane, explicit native-harness routing, verifier receipts, and launchd
+supervision.
