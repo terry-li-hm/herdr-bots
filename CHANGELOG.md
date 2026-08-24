@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
+## [0.2.0] - 2026-08-24
+
+macOS prerelease (preview): adds an opt-in unread-terminal-run attention guard
+for jobs. Existing v0.1.x configs remain valid, and the database migration
+is additive.
+
+### Added
+
+- Optional per-job `attention.max_unread_terminal_runs` guard (values 1-1000;
+  omitting the block preserves v0.1.x behavior exactly). When a job's count of
+  unread runs in terminal states reaches the limit, the scheduler pauses the job
+  before admitting another run — atomically, inside the same authority-fenced
+  admission transaction used by scheduled, event, and manual admission. A tripped
+  guard creates no run, occurrence, workspace, or agent.
+- Durable pause reason `unread_terminal_runs` (distinct from a manual pause's
+  `manual` reason) with a persisted pause timestamp; nonterminal runs never count,
+  and marking runs read never auto-resumes the job — only an explicit
+  `herdr-bots resume JOB` clears the pause. `herdr-bots list` shows the durable
+  pause reason without marking any run read.
+
 ## [0.1.1] - 2026-08-24
 
 ### Fixed
@@ -56,5 +76,6 @@ Derived implementation patterns from the MIT-licensed
 `DnzzL/herdr-automations` project at commit `08640f3` by Thomas Legrand;
 this implementation is separately maintained by Terry Li. See `NOTICE`.
 
+[0.2.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0
 [0.1.1]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1
 [0.1.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.0
