@@ -200,6 +200,32 @@ operator supplies `--canary`.
   holds everything without losing accepted runs.
 - `herdr-bots cancel RUN` closes a received Herdr workspace and marks the run
   cancelled.
+- Marking runs read (via `show` or the pane) never resumes a paused job;
+  explicit `herdr-bots resume JOB` is always required.
+
+## Unread-work guard (opt-in)
+
+Each job may set an optional attention gate:
+
+```yaml
+    attention:
+      max_unread_terminal_runs: 1
+```
+
+An explicit value must be between 1 and 1000; omitting the block preserves
+the current behavior exactly. When a job's number of **unread runs in
+terminal states** (succeeded, failed, blocked, timed_out, cancelled,
+interrupted) reaches the limit, the scheduler pauses that job *before*
+admitting another run — atomically, inside the same authority-fenced
+admission transaction used by scheduled, event, and manual admission. A
+tripped guard creates no run, occurrence, workspace, or agent. Runs begin
+unread, so nonterminal runs never count. Marking runs read lowers the count
+but never auto-resumes the job: only an explicit
+`herdr-bots resume JOB` clears the pause, its durable reason
+(`unread_terminal_runs`, distinct from a manual pause's `manual` reason), and
+its timestamp. `herdr-bots list` shows the durable pause reason without
+marking any run read. See [docs/grok-bot-learning.md](docs/grok-bot-learning.md)
+for the design provenance.
 - Unloading the launchd service (below) stops all scheduling; state is
   preserved.
 - `herdr plugin uninstall terry.herdr-bots` removes the plugin pane surface

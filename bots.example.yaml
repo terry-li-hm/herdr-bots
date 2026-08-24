@@ -66,6 +66,12 @@ jobs:
       Produce a local tested candidate. Do not push, merge, install, or send.
     timeout_minutes: 60
     overlap: forbid
+    # Unread-work guard (opt-in, DISABLED here by omission).
+    # Uncomment to pause this job before another run is admitted once the
+    # given number of terminal runs are still unread. Reading runs never
+    # resumes the job; only `herdr-bots resume local-repair-event` does.
+    # attention:
+    #   max_unread_terminal_runs: 1
     verifier:
       command: ["git", "diff", "--check"]
     limits:

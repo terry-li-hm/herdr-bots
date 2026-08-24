@@ -3272,3 +3272,195 @@ func mustTime(v string) time.Time {
 	}
 	return got
 }
+
+func writeJobsWithAttention(t *testing.T, repo string, limit int, event bool) string {
+	t.Helper()
+	path := writeJobs(t, repo, true)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(raw), "    prompt: Check docs.", fmt.Sprintf("    attention:\n      max_unread_terminal_runs: %d\n    prompt: Check docs.", limit), 1)
+	if event {
+		body = strings.Replace(body, "kind: cron\n      expression: \"0 9 * * *\"", "kind: event", 1)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestUnreadGuardPausesScheduledAdmissionBeforeAnotherRun(t *testing.T) {
+	repo := t.TempDir()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
+	client := &fakeHerdr{path: repo}
+	eng := New(state, client, fakeCommands{models: "provider model\nopenai-codex gpt-5.6-sol\n"}, writeJobsWithAttention(t, repo, 1, false))
+	eng.DiskCapacity = func(string) (DiskCapacity, error) { return DiskCapacity{FreeGiB: 100, Device: 1}, nil }
+	ctx := context.Background()
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T08:59:00+08:00")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:00:30+08:00")); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForTerminal(t, state, "docs-drift")
+	if run.State != store.StateSucceeded || !run.Unread {
+		t.Fatalf("first run=%+v", run)
+	}
+	// The next day's occurrence must pause the job before admitting anything.
+	if err := eng.Evaluate(ctx, mustTime("2026-08-23T09:00:30+08:00")); err != nil {
+		t.Fatal(err)
+	}
+	jobState, err := state.Job(ctx, "docs-drift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jobState.Paused || jobState.PauseReason != store.PauseReasonUnreadTerminalRuns || jobState.PauseAt.IsZero() {
+		t.Fatalf("guard pause state=%+v", jobState)
+	}
+	runs, listErr := state.ListRuns(ctx, "docs-drift", 10)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+	client.mu.Lock()
+	provisions := client.provisions
+	client.mu.Unlock()
+	if provisions != 1 {
+		t.Fatalf("guard admitted a second workspace: provisions=%d", provisions)
+	}
+	// Marking the run read never auto-resumes the job.
+	if err := state.MarkRead(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	jobState, err = state.Job(ctx, "docs-drift")
+	if err != nil || !jobState.Paused {
+		t.Fatalf("reading auto-resumed: %+v err=%v", jobState, err)
+	}
+}
+
+func TestUnreadGuardPausesEventAdmission(t *testing.T) {
+	repo := t.TempDir()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
+	client := &fakeHerdr{path: repo}
+	eng := New(state, client, fakeCommands{models: "provider model\nopenai-codex gpt-5.6-sol\n"}, writeJobsWithAttention(t, repo, 1, true))
+	eng.DiskCapacity = func(string) (DiskCapacity, error) { return DiskCapacity{FreeGiB: 100, Device: 1}, nil }
+	ctx := context.Background()
+	if _, err := eng.Enqueue(ctx, "docs-drift", "first-event", mustTime("2026-08-22T01:00:00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Dispatch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first := waitForTerminal(t, state, "docs-drift")
+	if !first.Unread {
+		t.Fatalf("first run was not unread: %+v", first)
+	}
+	_, err = eng.Enqueue(ctx, "docs-drift", "second-event", mustTime("2026-08-22T02:00:00Z"))
+	var notAccepted *EventNotAcceptedError
+	if !errors.As(err, &notAccepted) || notAccepted.Outcome != "paused_unread_limit" {
+		t.Fatalf("second enqueue err=%v", err)
+	}
+	jobState, err := state.Job(ctx, "docs-drift")
+	if err != nil || !jobState.Paused || jobState.PauseReason != store.PauseReasonUnreadTerminalRuns {
+		t.Fatalf("job=%+v err=%v", jobState, err)
+	}
+	runs, listErr := state.ListRuns(ctx, "docs-drift", 10)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+}
+
+func TestUnreadGuardPausesManualAdmission(t *testing.T) {
+	repo := t.TempDir()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
+	client := &fakeHerdr{path: repo}
+	eng := New(state, client, fakeCommands{models: "provider model\nopenai-codex gpt-5.6-sol\n"}, writeJobsWithAttention(t, repo, 1, false))
+	eng.DiskCapacity = func(string) (DiskCapacity, error) { return DiskCapacity{FreeGiB: 100, Device: 1}, nil }
+	ctx := context.Background()
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T08:59:00+08:00")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:00:30+08:00")); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForTerminal(t, state, "docs-drift")
+	if !run.Unread {
+		t.Fatalf("first run was not unread: %+v", run)
+	}
+	_, runErr := eng.RunNow(ctx, "docs-drift", false, mustTime("2026-08-22T10:00:00Z"))
+	if !errors.Is(runErr, store.ErrJobUnreadPaused) {
+		t.Fatalf("RunNow err=%v", runErr)
+	}
+	jobState, err := state.Job(ctx, "docs-drift")
+	if err != nil || !jobState.Paused || jobState.PauseReason != store.PauseReasonUnreadTerminalRuns {
+		t.Fatalf("job=%+v err=%v", jobState, err)
+	}
+	runs, listErr := state.ListRuns(ctx, "docs-drift", 10)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+}
+
+func TestUnreadGuardStopsAtFirstDueOccurrenceWhenMultipleAreDue(t *testing.T) {
+	repo := t.TempDir()
+	state, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
+	client := &fakeHerdr{path: repo}
+	// Every minute, so two occurrences fall due inside one evaluation window.
+	path := writeJobsWithAttention(t, repo, 1, false)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(string(raw), `"0 9 * * *"`, `"* * * * *"`, 1)
+	// Widen the grace so both due occurrences are admissible rather than missed.
+	body = strings.Replace(body, "catch_up_grace_minutes: 0", "catch_up_grace_minutes: 120", 1)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng := New(state, client, fakeCommands{models: "provider model\nopenai-codex gpt-5.6-sol\n"}, path)
+	eng.DiskCapacity = func(string) (DiskCapacity, error) { return DiskCapacity{FreeGiB: 100, Device: 1}, nil }
+	ctx := context.Background()
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T08:59:00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:00:30Z")); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForTerminal(t, state, "docs-drift")
+	if run.State != store.StateSucceeded || !run.Unread {
+		t.Fatalf("first run=%+v", run)
+	}
+	// Two further occurrences fall due in this single evaluation; the guard
+	// must pause on the first and stop instead of returning ErrJobPaused.
+	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:02:30Z")); err != nil {
+		t.Fatalf("second evaluation returned %v; want nil (guard stops before the authority fence)", err)
+	}
+	jobState, err := state.Job(ctx, "docs-drift")
+	if err != nil || !jobState.Paused || jobState.PauseReason != store.PauseReasonUnreadTerminalRuns {
+		t.Fatalf("job=%+v err=%v", jobState, err)
+	}
+	runs, listErr := state.ListRuns(ctx, "docs-drift", 10)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+	last, err := state.LastJobResult(ctx, "docs-drift")
+	if err != nil || last != "succeeded" {
+		t.Fatalf("last result=%q err=%v; want succeeded from the first run only", last, err)
+	}
+}

@@ -210,18 +210,26 @@ func listCmd(args []string) error {
 		return err
 	}
 	defer state.Close()
-	fmt.Printf("%-24s %-8s %-10s %-18s %-22s %-10s\n", "JOB", "ENABLED", "HARNESS", "PROVIDER", "MODEL", "LAST")
+	fmt.Printf("%-24s %-8s %-10s %-18s %-22s %-20s %-10s\n", "JOB", "ENABLED", "HARNESS", "PROVIDER", "MODEL", "PAUSED", "LAST")
 	ctx := context.Background()
 	for _, job := range cfg.Jobs {
 		last := "never"
 		if result, resultErr := state.LastJobResult(ctx, job.ID); resultErr == nil && result != "" {
 			last = result
 		}
+		// The durable pause reason is reported without touching run read state.
+		paused := "-"
+		if jobState, stateErr := state.Job(ctx, job.ID); stateErr == nil && jobState.Paused {
+			paused = jobState.PauseReason
+			if paused == "" {
+				paused = "paused"
+			}
+		}
 		provider := job.Execution.Provider
 		if provider == "" {
 			provider = "-"
 		}
-		fmt.Printf("%-24s %-8t %-10s %-18s %-22s %-10s\n", job.ID, job.IsEnabled(), job.Execution.Harness, provider, job.Execution.Model, last)
+		fmt.Printf("%-24s %-8t %-10s %-18s %-22s %-20s %-10s\n", job.ID, job.IsEnabled(), job.Execution.Harness, provider, job.Execution.Model, paused, last)
 	}
 	return nil
 }

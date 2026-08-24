@@ -44,6 +44,16 @@ var (
 	ErrJobPaused          = errors.New("event job is paused")
 	ErrGlobalPaused       = errors.New("automation execution is globally paused")
 	ErrJobRevisionChanged = errors.New("saved job authority changed during synchronization")
+	// ErrJobUnreadPaused reports that the opt-in unread-work guard paused the
+	// job instead of admitting another run. Marking runs read never resumes the
+	// job; only an explicit resume does.
+	ErrJobUnreadPaused = errors.New("job paused by the unread terminal-run guard")
+)
+
+// Durable pause reasons persisted with the pause timestamp.
+const (
+	PauseReasonManual             = "manual"
+	PauseReasonUnreadTerminalRuns = "unread_terminal_runs"
 )
 
 func IsTerminalState(state string) bool { return terminalStates[state] }
@@ -65,6 +75,8 @@ type JobState struct {
 	Definition     []byte
 	Enabled        bool
 	Paused         bool
+	PauseReason    string
+	PauseAt        time.Time
 	Completed      bool
 	Cursor         time.Time
 }
@@ -127,6 +139,9 @@ type AcceptRequest struct {
 	SourceRevision     string
 	InputContext       string
 	Now                time.Time
+	// MaxUnreadTerminalRuns is the opt-in unread-work guard limit. Zero means
+	// no guard; admission behaves exactly as before the guard existed.
+	MaxUnreadTerminalRuns int
 }
 
 type SuccessfulSource struct {
@@ -289,6 +304,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   definition BLOB NOT NULL,
   enabled INTEGER NOT NULL,
   paused INTEGER NOT NULL DEFAULT 0,
+  pause_reason TEXT NOT NULL DEFAULT '',
+  pause_at TEXT NOT NULL DEFAULT '',
   completed INTEGER NOT NULL DEFAULT 0,
   cursor TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -382,6 +399,8 @@ CREATE TABLE IF NOT EXISTS metadata (
 		{"runs", "source_base_revision", "TEXT NOT NULL DEFAULT ''"},
 		{"runs", "source_revision", "TEXT NOT NULL DEFAULT ''"},
 		{"runs", "input_context", "TEXT NOT NULL DEFAULT ''"},
+		{"jobs", "pause_reason", "TEXT NOT NULL DEFAULT ''"},
+		{"jobs", "pause_at", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if err = ensureColumn(ctx, conn, column.table, column.column, column.definition); err != nil {
@@ -716,13 +735,20 @@ func syncJobAuthorityTx(ctx context.Context, tx *sql.Tx, id string, configRevisi
 func (s *Store) Job(ctx context.Context, id string) (JobState, error) {
 	var out JobState
 	var enabled, paused, completed int
-	var cursor string
-	err := s.db.QueryRowContext(ctx, `SELECT id,config_revision,revision,definition,enabled,paused,completed,cursor FROM jobs WHERE id=?`, id).
-		Scan(&out.ID, &out.ConfigRevision, &out.Revision, &out.Definition, &enabled, &paused, &completed, &cursor)
+	var cursor, pauseReason, pauseAt string
+	err := s.db.QueryRowContext(ctx, `SELECT id,config_revision,revision,definition,enabled,paused,completed,cursor,pause_reason,pause_at FROM jobs WHERE id=?`, id).
+		Scan(&out.ID, &out.ConfigRevision, &out.Revision, &out.Definition, &enabled, &paused, &completed, &cursor, &pauseReason, &pauseAt)
 	if err != nil {
 		return out, err
 	}
 	out.Enabled, out.Paused, out.Completed = enabled != 0, paused != 0, completed != 0
+	out.PauseReason = pauseReason
+	if pauseAt != "" {
+		out.PauseAt, err = parseTime(pauseAt)
+		if err != nil {
+			return out, err
+		}
+	}
 	out.Cursor, err = parseTime(cursor)
 	return out, err
 }
@@ -780,8 +806,23 @@ func (s *Store) updateJobIfAuthority(ctx context.Context, id string, configRevis
 	return tx.Commit()
 }
 
+// SetPaused changes a job's manual pause state. Pausing records the manual
+// reason and timestamp; resuming clears both. The unread-work guard records
+// its own durable reason inside the admission transaction instead.
 func (s *Store) SetPaused(ctx context.Context, id string, paused bool) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET paused=?, updated_at=? WHERE id=?`, boolInt(paused), formatTime(time.Now()), id)
+	if paused {
+		now := time.Now()
+		res, err := s.db.ExecContext(ctx, `UPDATE jobs SET paused=1,pause_reason=?,pause_at=?,updated_at=? WHERE id=?`, PauseReasonManual, formatTime(now), formatTime(now), id)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET paused=0,pause_reason='',pause_at='',updated_at=? WHERE id=?`, formatTime(time.Now()), id)
 	if err != nil {
 		return err
 	}
@@ -826,6 +867,12 @@ func (s *Store) RecordOccurrence(ctx context.Context, jobID, occurrenceKey strin
 func (s *Store) AcceptOccurrence(ctx context.Context, req AcceptRequest) (AcceptResult, error) {
 	if req.OccurrenceKey == "" {
 		return AcceptResult{}, fmt.Errorf("occurrence key is required")
+	}
+	// AcceptOccurrence is not authority-fenced. The unread-work guard must
+	// recheck job authority inside the same serialized admission transaction,
+	// so fail closed rather than pausing or admitting on stale authority.
+	if req.MaxUnreadTerminalRuns != 0 {
+		return AcceptResult{}, errors.New("unread terminal-run guard requires authority-fenced admission")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -959,6 +1006,44 @@ func (s *Store) EnqueueEvent(ctx context.Context, req AcceptRequest) (AcceptResu
 	return acceptOccurrenceTx(ctx, tx, req)
 }
 
+// countUnreadTerminalRunsTx counts only unread runs already in terminal
+// states. Runs begin unread in nonterminal states, so accepted, provisioning,
+// starting, running, settled, and verifying runs never count.
+func countUnreadTerminalRunsTx(ctx context.Context, tx *sql.Tx, jobID string) (int, error) {
+	var unread int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE job_id=? AND unread=1 AND state IN ('succeeded','failed','blocked','timed_out','cancelled','interrupted')`, jobID).Scan(&unread); err != nil {
+		return 0, err
+	}
+	return unread, nil
+}
+
+// enforceUnreadGuardTx is the unread-work admission guard. It must run inside
+// the same serialized admission transaction that already fenced job authority,
+// so a stale revision or concurrent authority change can neither pause the job
+// nor admit work. When the configured limit of unread terminal runs is reached
+// it atomically pauses the job and commits without creating a run, an
+// occurrence, or any other side effect; repeated evaluation is idempotent.
+func enforceUnreadGuardTx(ctx context.Context, tx *sql.Tx, req AcceptRequest) (AcceptResult, bool, error) {
+	if req.MaxUnreadTerminalRuns <= 0 {
+		return AcceptResult{}, false, nil
+	}
+	unread, err := countUnreadTerminalRunsTx(ctx, tx, req.JobID)
+	if err != nil {
+		return AcceptResult{}, false, err
+	}
+	if unread < req.MaxUnreadTerminalRuns {
+		return AcceptResult{}, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET paused=1,pause_reason=?,pause_at=?,updated_at=? WHERE id=?`, PauseReasonUnreadTerminalRuns, formatTime(req.Now), formatTime(req.Now), req.JobID); err != nil {
+		return AcceptResult{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AcceptResult{}, false, err
+	}
+	detail := fmt.Sprintf("%d unread terminal runs reached the configured limit %d; job paused until explicit resume", unread, req.MaxUnreadTerminalRuns)
+	return AcceptResult{Outcome: "paused_unread_limit", Detail: detail}, true, nil
+}
+
 func requireJobAuthorityTx(ctx context.Context, tx *sql.Tx, id string, configRevision int, snapshotHash string, requireRunnable bool) error {
 	var savedRevision, enabled, paused int
 	var savedHash string
@@ -1037,6 +1122,15 @@ func acceptOccurrenceTx(ctx context.Context, tx *sql.Tx, req AcceptRequest) (Acc
 		return existing, nil
 	}
 
+	// The unread-work guard runs before any admission decision records an
+	// occurrence, so a tripped limit creates no run, occurrence, or other side
+	// effect: it only pauses the job atomically.
+	if guard, tripped, err := enforceUnreadGuardTx(ctx, tx, req); err != nil {
+		return AcceptResult{}, err
+	} else if tripped {
+		return guard, nil
+	}
+
 	dayEnd := req.DayEnd
 	if dayEnd.IsZero() {
 		dayEnd = req.DayStart.Add(24 * time.Hour)
@@ -1098,6 +1192,24 @@ func (s *Store) CreateManualRunIfAuthority(ctx context.Context, req AcceptReques
 	}
 	if err := requireJobAuthorityTx(ctx, tx, req.JobID, req.JobConfigRevision, req.JobRevision, true); err != nil {
 		return Run{}, err
+	}
+	// The unread-work guard rechecks inside the same authority-fenced manual
+	// admission transaction. A tripped guard pauses the job atomically and
+	// creates nothing.
+	if req.MaxUnreadTerminalRuns > 0 {
+		unread, countErr := countUnreadTerminalRunsTx(ctx, tx, req.JobID)
+		if countErr != nil {
+			return Run{}, countErr
+		}
+		if unread >= req.MaxUnreadTerminalRuns {
+			if _, err = tx.ExecContext(ctx, `UPDATE jobs SET paused=1,pause_reason=?,pause_at=?,updated_at=? WHERE id=?`, PauseReasonUnreadTerminalRuns, formatTime(req.Now), formatTime(req.Now), req.JobID); err != nil {
+				return Run{}, err
+			}
+			if err := tx.Commit(); err != nil {
+				return Run{}, err
+			}
+			return Run{}, fmt.Errorf("%w: job %s has %d unread terminal runs at the configured limit %d", ErrJobUnreadPaused, req.JobID, unread, req.MaxUnreadTerminalRuns)
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,accepted_at,accepted_unix_nano,updated_at) VALUES(?,?,?,?, 'manual',?,?,?,?)`, id, req.JobID, req.JobRevision, req.Definition, StateAccepted, formatTime(req.Now), req.Now.UnixNano(), formatTime(req.Now)); err != nil {
 		return Run{}, err

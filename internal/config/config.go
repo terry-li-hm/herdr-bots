@@ -65,17 +65,27 @@ type Capacity struct {
 }
 
 type Job struct {
-	ID             string    `yaml:"id" json:"id"`
-	Revision       int       `yaml:"revision" json:"revision"`
-	Enabled        *bool     `yaml:"enabled,omitempty" json:"enabled"`
-	Schedule       Schedule  `yaml:"schedule" json:"schedule"`
-	Execution      Execution `yaml:"execution" json:"execution"`
-	RunIfChanged   bool      `yaml:"run_if_changed,omitempty" json:"run_if_changed"`
-	Prompt         string    `yaml:"prompt" json:"prompt"`
-	TimeoutMinutes int       `yaml:"timeout_minutes,omitempty" json:"timeout_minutes"`
-	Overlap        string    `yaml:"overlap,omitempty" json:"overlap"`
-	Verifier       *Verifier `yaml:"verifier,omitempty" json:"verifier,omitempty"`
-	Limits         Limits    `yaml:"limits,omitempty" json:"limits"`
+	ID             string     `yaml:"id" json:"id"`
+	Revision       int        `yaml:"revision" json:"revision"`
+	Enabled        *bool      `yaml:"enabled,omitempty" json:"enabled"`
+	Schedule       Schedule   `yaml:"schedule" json:"schedule"`
+	Execution      Execution  `yaml:"execution" json:"execution"`
+	RunIfChanged   bool       `yaml:"run_if_changed,omitempty" json:"run_if_changed"`
+	Prompt         string     `yaml:"prompt" json:"prompt"`
+	TimeoutMinutes int        `yaml:"timeout_minutes,omitempty" json:"timeout_minutes"`
+	Overlap        string     `yaml:"overlap,omitempty" json:"overlap"`
+	Verifier       *Verifier  `yaml:"verifier,omitempty" json:"verifier,omitempty"`
+	Limits         Limits     `yaml:"limits,omitempty" json:"limits"`
+	Attention      *Attention `yaml:"attention,omitempty" json:"attention,omitempty"`
+}
+
+// Attention holds opt-in operator-attention gates. An absent attention block
+// preserves the historical admission behavior exactly.
+type Attention struct {
+	// MaxUnreadTerminalRuns pauses the job before another run is admitted when
+	// this many terminal runs are still unread. Runs begin unread, so only
+	// terminal states are counted. An explicit value must be 1..1000.
+	MaxUnreadTerminalRuns *int `yaml:"max_unread_terminal_runs,omitempty" json:"max_unread_terminal_runs,omitempty"`
 }
 
 type Schedule struct {
@@ -267,6 +277,12 @@ func (j Job) validate() error {
 	if math.IsNaN(reserve) || math.IsInf(reserve, 0) || reserve < 0.25 || reserve > 64 {
 		return fmt.Errorf("%s: disk_reserve_gib must be between 0.25 and 64", j.ID)
 	}
+	if j.Attention != nil && j.Attention.MaxUnreadTerminalRuns != nil {
+		limit := *j.Attention.MaxUnreadTerminalRuns
+		if limit < minUnreadTerminalRunsLimit || limit > maxUnreadTerminalRunsLimit {
+			return fmt.Errorf("%s: attention.max_unread_terminal_runs must be between %d and %d", j.ID, minUnreadTerminalRunsLimit, maxUnreadTerminalRunsLimit)
+		}
+	}
 	if err := j.Schedule.validate(j.ID); err != nil {
 		return err
 	}
@@ -297,6 +313,18 @@ func (j Job) DiskReserve() float64 {
 		return DefaultDiskReserveGiB
 	}
 	return *j.Limits.DiskReserveGiB
+}
+
+const minUnreadTerminalRunsLimit = 1
+const maxUnreadTerminalRunsLimit = 1000
+
+// MaxUnreadTerminalRuns returns the configured unread-work guard limit, or 0
+// when no policy is configured. Zero always means "no guard".
+func (j Job) MaxUnreadTerminalRuns() int {
+	if j.Attention == nil || j.Attention.MaxUnreadTerminalRuns == nil {
+		return 0
+	}
+	return *j.Attention.MaxUnreadTerminalRuns
 }
 
 func (c *Capacity) applyDefaults() {

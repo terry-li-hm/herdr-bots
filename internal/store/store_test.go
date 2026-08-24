@@ -1672,3 +1672,400 @@ func TestManualRunAuthorityRefusesDisabledAndPausedJobs(t *testing.T) {
 		})
 	}
 }
+
+// seedUnreadTerminalRun inserts one finished run for job "job" in the given
+// terminal state; it stays unread unless read is true.
+func seedUnreadTerminalRun(t *testing.T, s *Store, state string, read bool) {
+	t.Helper()
+	ctx := context.Background()
+	now := ts("2026-08-23T01:00:00Z")
+	run, err := s.CreateManualRun(ctx, "job", "hash-v1", []byte(`{"id":"job","revision":1}`), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsTerminalState(state) {
+		if err := s.Finish(ctx, run.ID, StateAccepted, state, "completed", "completed", "unverified", "", "seeded", now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := s.Transition(ctx, run.ID, StateAccepted, state, "seeded nonterminal", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if read {
+		if err := s.MarkRead(ctx, run.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func syncGuardJob(t *testing.T, s *Store) {
+	t.Helper()
+	now := ts("2026-08-23T00:00:00Z")
+	if _, err := s.SyncJobAuthority(context.Background(), "job", 1, "hash-v1", []byte(`{"id":"job","revision":1}`), true, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func guardOccurrences(s *Store) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM occurrences WHERE job_id='job'`).Scan(&n)
+	return n, err
+}
+
+func TestUnreadGuardCountsOnlyUnreadTerminalRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit int
+		steps []struct {
+			state string
+			read  bool
+		}
+		wantTripped bool
+		wantOutcome string
+	}{
+		{name: "nonterminal unread runs never count", limit: 1, steps: []struct {
+			state string
+			read  bool
+		}{{StateAccepted, false}, {StateRunning, false}}, wantTripped: false, wantOutcome: "skipped_overlap"},
+		{name: "read terminal runs never count", limit: 1, steps: []struct {
+			state string
+			read  bool
+		}{{StateSucceeded, true}, {StateFailed, true}}, wantTripped: false, wantOutcome: "accepted"},
+		{name: "unread terminal runs count exactly", limit: 2, steps: []struct {
+			state string
+			read  bool
+		}{{StateSucceeded, false}, {StateFailed, false}}, wantTripped: true, wantOutcome: "paused_unread_limit"},
+		{name: "below the limit admits", limit: 3, steps: []struct {
+			state string
+			read  bool
+		}{{StateSucceeded, false}, {StateFailed, false}}, wantTripped: false, wantOutcome: "accepted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testStore(t)
+			syncGuardJob(t, s)
+			for _, step := range tc.steps {
+				seedUnreadTerminalRun(t, s, step.state, step.read)
+			}
+			now := ts("2026-08-23T03:00:00Z")
+			req := scheduledAuthorityRequest(now, 1, "hash-v1", []byte(`{"id":"job","revision":1}`))
+			req.MaxUnreadTerminalRuns = tc.limit
+			result, err := s.AcceptScheduledOccurrence(context.Background(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			job, err := s.Job(context.Background(), "job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			occurrences, occErr := guardOccurrences(s)
+			if occErr != nil {
+				t.Fatal(occErr)
+			}
+			if tc.wantTripped {
+				if result.Run != nil || result.Inserted || result.Outcome != "paused_unread_limit" {
+					t.Fatalf("tripped result=%+v", result)
+				}
+				if !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns || job.PauseAt.IsZero() {
+					t.Fatalf("guard pause state=%+v", job)
+				}
+				if occurrences != 0 {
+					t.Fatalf("tripped guard recorded %d occurrences", occurrences)
+				}
+			} else {
+				if result.Outcome != tc.wantOutcome || job.Paused {
+					t.Fatalf("outcome=%q want=%q job=%+v", result.Outcome, tc.wantOutcome, job)
+				}
+			}
+		})
+	}
+}
+
+func TestUnreadGuardIsIdempotentAndDoesNotDuplicateEffects(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	syncGuardJob(t, s)
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+	now := ts("2026-08-23T03:00:00Z")
+	definition := []byte(`{"id":"job","revision":1}`)
+	for i := 0; i < 3; i++ {
+		req := scheduledAuthorityRequest(now.Add(time.Duration(i)*time.Minute), 1, "hash-v1", definition)
+		req.MaxUnreadTerminalRuns = 1
+		if i == 0 {
+			result, err := s.AcceptScheduledOccurrence(ctx, req)
+			if err != nil || result.Outcome != "paused_unread_limit" {
+				t.Fatalf("first evaluation result=%+v err=%v", result, err)
+			}
+		} else {
+			// The job is already durably paused; repeated evaluation refuses at
+			// the authority fence without pausing twice or admitting anything.
+			if _, err := s.AcceptScheduledOccurrence(ctx, req); !errors.Is(err, ErrJobPaused) {
+				t.Fatalf("repeat %d error=%v want ErrJobPaused", i, err)
+			}
+		}
+	}
+	job, err := s.Job(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns {
+		t.Fatalf("job=%+v", job)
+	}
+	runs, err := s.ListRuns(ctx, "job", 20)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	occurrences, occErr := guardOccurrences(s)
+	if occErr != nil || occurrences != 0 {
+		t.Fatalf("occurrences=%d err=%v", occurrences, occErr)
+	}
+}
+
+func TestUnreadGuardStaleAuthorityCannotPauseOrAdmit(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := ts("2026-08-23T02:00:00Z")
+	v1 := []byte(`{"id":"job","revision":1}`)
+	v2 := []byte(`{"id":"job","revision":2}`)
+	if _, err := s.SyncJobAuthority(ctx, "job", 1, "hash-v1", v1, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SyncJobAuthority(ctx, "job", 2, "hash-v2", v2, true, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+
+	stale := scheduledAuthorityRequest(now.Add(2*time.Minute), 1, "hash-v1", v1)
+	stale.MaxUnreadTerminalRuns = 1
+	if _, err := s.AcceptScheduledOccurrence(ctx, stale); !errors.Is(err, ErrJobRevisionChanged) {
+		t.Fatalf("stale scheduled error=%v", err)
+	}
+	// Stale manual runs use the same authority fence before the guard.
+	staleManual := scheduledAuthorityRequest(now.Add(3*time.Minute), 1, "hash-v1", v1)
+	staleManual.MaxUnreadTerminalRuns = 1
+	if _, err := s.CreateManualRunIfAuthority(ctx, staleManual); !errors.Is(err, ErrJobRevisionChanged) {
+		t.Fatalf("stale manual error=%v", err)
+	}
+	// Stale event delivery with a new identity refuses at synchronization.
+	staleEvent := scheduledAuthorityRequest(now.Add(4*time.Minute), 1, "hash-v1", v1)
+	staleEvent.Trigger = "event"
+	staleEvent.OccurrenceKey = "event:stale-guard"
+	staleEvent.MaxUnreadTerminalRuns = 1
+	if _, err := s.EnqueueEvent(ctx, staleEvent); !errors.Is(err, ErrJobRevisionChanged) {
+		t.Fatalf("stale event error=%v", err)
+	}
+
+	job, err := s.Job(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Paused || job.PauseReason != "" || !job.PauseAt.IsZero() {
+		t.Fatalf("stale authority paused the job: %+v", job)
+	}
+	occurrences, occErr := guardOccurrences(s)
+	if occErr != nil || occurrences != 0 {
+		t.Fatalf("stale authority recorded %d occurrences err=%v", occurrences, occErr)
+	}
+}
+
+func TestUnreadGuardPausesEventAndManualAdmission(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	now := ts("2026-08-23T02:00:00Z")
+	definition := []byte(`{"id":"job","revision":1}`)
+	if _, err := s.SyncJobAuthority(ctx, "job", 1, "hash-v1", definition, true, now); err != nil {
+		t.Fatal(err)
+	}
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+
+	eventReq := scheduledAuthorityRequest(now.Add(time.Minute), 1, "hash-v1", definition)
+	eventReq.Trigger = "event"
+	eventReq.OccurrenceKey = "event:guard"
+	eventReq.MaxUnreadTerminalRuns = 1
+	result, err := s.EnqueueEvent(ctx, eventReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run != nil || result.Inserted || result.Outcome != "paused_unread_limit" {
+		t.Fatalf("event result=%+v", result)
+	}
+	job, err := s.Job(ctx, "job")
+	if err != nil || !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns {
+		t.Fatalf("event guard job=%+v err=%v", job, err)
+	}
+	if err := s.SetPaused(ctx, "job", false); err != nil {
+		t.Fatal(err)
+	}
+
+	manualReq := scheduledAuthorityRequest(now.Add(2*time.Minute), 1, "hash-v1", definition)
+	manualReq.Trigger = "manual"
+	manualReq.MaxUnreadTerminalRuns = 1
+	if _, err := s.CreateManualRunIfAuthority(ctx, manualReq); !errors.Is(err, ErrJobUnreadPaused) {
+		t.Fatalf("manual error=%v", err)
+	}
+	job, err = s.Job(ctx, "job")
+	if err != nil || !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns {
+		t.Fatalf("manual guard job=%+v err=%v", job, err)
+	}
+	runs, listErr := s.ListRuns(ctx, "job", 20)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+}
+
+func TestPauseReasonsManualVersusGuardAndResumeClears(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	syncGuardJob(t, s)
+	if err := s.SetPaused(ctx, "job", true); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Job(ctx, "job")
+	if err != nil || !job.Paused || job.PauseReason != PauseReasonManual || job.PauseAt.IsZero() {
+		t.Fatalf("manual pause job=%+v err=%v", job, err)
+	}
+	if err := s.SetPaused(ctx, "job", false); err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.Job(ctx, "job")
+	if err != nil || job.Paused || job.PauseReason != "" || !job.PauseAt.IsZero() {
+		t.Fatalf("resume did not clear pause job=%+v err=%v", job, err)
+	}
+
+	// A guard pause records its own reason; explicit resume clears it too.
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+	now := ts("2026-08-23T03:00:00Z")
+	req := scheduledAuthorityRequest(now, 1, "hash-v1", []byte(`{"id":"job","revision":1}`))
+	req.MaxUnreadTerminalRuns = 1
+	if _, err := s.AcceptScheduledOccurrence(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.Job(ctx, "job")
+	if err != nil || !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns {
+		t.Fatalf("guard pause job=%+v err=%v", job, err)
+	}
+	if err := s.SetPaused(ctx, "job", false); err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.Job(ctx, "job")
+	if err != nil || job.Paused || job.PauseReason != "" || !job.PauseAt.IsZero() {
+		t.Fatalf("resume after guard job=%+v err=%v", job, err)
+	}
+}
+
+func TestMarkingRunsReadDoesNotResumeGuardPausedJob(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	syncGuardJob(t, s)
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+	now := ts("2026-08-23T03:00:00Z")
+	req := scheduledAuthorityRequest(now, 1, "hash-v1", []byte(`{"id":"job","revision":1}`))
+	req.MaxUnreadTerminalRuns = 1
+	if _, err := s.AcceptScheduledOccurrence(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.ListRuns(ctx, "job", 5)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	if err := s.MarkRead(ctx, runs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Job(ctx, "job")
+	if err != nil || !job.Paused || job.PauseReason != PauseReasonUnreadTerminalRuns {
+		t.Fatalf("reading runs auto-resumed the job: %+v err=%v", job, err)
+	}
+	// After the operator reads everything, an explicit resume admits again.
+	if err := s.SetPaused(ctx, "job", false); err != nil {
+		t.Fatal(err)
+	}
+	later := scheduledAuthorityRequest(now.Add(time.Minute), 1, "hash-v1", []byte(`{"id":"job","revision":1}`))
+	later.MaxUnreadTerminalRuns = 1
+	result, err := s.AcceptScheduledOccurrence(ctx, later)
+	if err != nil || result.Run == nil || result.Outcome != "accepted" {
+		t.Fatalf("post-resume result=%+v err=%v", result, err)
+	}
+}
+
+func TestOpenMigratesPauseColumnsPreservingHistoricalRowsAndStates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-pause.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE jobs (
+  id TEXT PRIMARY KEY, revision TEXT NOT NULL, definition BLOB NOT NULL,
+  enabled INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
+  completed INTEGER NOT NULL DEFAULT 0, cursor TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE runs (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, job_revision TEXT NOT NULL,
+  definition BLOB NOT NULL, trigger TEXT NOT NULL, scheduled_for TEXT,
+  state TEXT NOT NULL, infrastructure_result TEXT NOT NULL DEFAULT '',
+  agent_result TEXT NOT NULL DEFAULT '', task_verdict TEXT NOT NULL DEFAULT 'unverified',
+  accepted_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '', worktree_path TEXT NOT NULL DEFAULT '',
+  execution_mode TEXT NOT NULL DEFAULT 'agent', completion_marker TEXT NOT NULL DEFAULT '',
+  error_code TEXT NOT NULL DEFAULT '', error_detail TEXT NOT NULL DEFAULT '',
+  unread INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(job_id) REFERENCES jobs(id)
+);
+INSERT INTO jobs(id,revision,definition,enabled,paused,cursor,updated_at)
+VALUES('job','hash-v1','{"id":"job","revision":1}',1,1,'2026-08-22T00:00:00Z','2026-08-22T00:00:00Z');
+INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,accepted_at,updated_at,unread)
+VALUES('legacy-run','job','hash-v1','{"id":"job","revision":1}','manual','succeeded','2026-08-22T00:00:00Z','2026-08-22T00:00:00Z',1);
+`)
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	job, err := s.Job(context.Background(), "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !job.Paused || job.PauseReason != "" || !job.PauseAt.IsZero() {
+		t.Fatalf("legacy paused job backfilled reason=%q at=%v", job.PauseReason, job.PauseAt)
+	}
+	run, err := s.GetRun(context.Background(), "legacy-run")
+	if err != nil || run.State != StateSucceeded || !run.Unread {
+		t.Fatalf("legacy run=%+v err=%v", run, err)
+	}
+}
+
+func TestUnreadGuardFailsClosedWithoutAuthorityFence(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	syncGuardJob(t, s)
+	seedUnreadTerminalRun(t, s, StateSucceeded, false)
+	now := ts("2026-08-23T03:00:00Z")
+	req := request(now)
+	req.MaxUnreadTerminalRuns = 1
+	_, err := s.AcceptOccurrence(ctx, req)
+	if err == nil || !strings.Contains(err.Error(), "authority-fenced") {
+		t.Fatalf("AcceptOccurrence error=%v", err)
+	}
+	job, err := s.Job(ctx, "job")
+	if err != nil || job.Paused || job.PauseReason != "" {
+		t.Fatalf("unfenced call paused the job: %+v err=%v", job, err)
+	}
+	runs, listErr := s.ListRuns(ctx, "job", 20)
+	if listErr != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, listErr)
+	}
+	occurrences, occErr := guardOccurrences(s)
+	if occErr != nil || occurrences != 0 {
+		t.Fatalf("occurrences=%d err=%v", occurrences, occErr)
+	}
+	// Zero (the default) keeps the historical unfenced path usable.
+	req.MaxUnreadTerminalRuns = 0
+	result, err := s.AcceptOccurrence(ctx, req)
+	if err != nil || result.Run == nil {
+		t.Fatalf("zero-limit AcceptOccurrence result=%+v err=%v", result, err)
+	}
+}

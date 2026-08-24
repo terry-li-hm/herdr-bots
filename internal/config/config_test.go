@@ -317,3 +317,37 @@ func TestValidateEventID(t *testing.T) {
 		}
 	}
 }
+
+func TestAttentionUnreadGuardIsOptionalAndValidated(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validYAML()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Jobs[0].Attention != nil || cfg.Jobs[0].MaxUnreadTerminalRuns() != 0 {
+		t.Fatalf("omitted attention must preserve current behavior: %+v", cfg.Jobs[0].Attention)
+	}
+	withLimit := strings.Replace(validYAML(), "    prompt: Check documentation drift.", "    attention:\n      max_unread_terminal_runs: 1\n    prompt: Check documentation drift.", 1)
+	cfg, err = Load(writeConfig(t, withLimit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Jobs[0].MaxUnreadTerminalRuns(); got != 1 {
+		t.Fatalf("limit=%d want 1", got)
+	}
+	for _, limit := range []string{"0", "1001", "-3"} {
+		body := strings.Replace(withLimit, "max_unread_terminal_runs: 1", "max_unread_terminal_runs: "+limit, 1)
+		if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "attention.max_unread_terminal_runs") {
+			t.Fatalf("limit %s: expected bound error, got %v", limit, err)
+		}
+	}
+	for _, limit := range []string{"1", "1000"} {
+		body := strings.Replace(withLimit, "max_unread_terminal_runs: 1", "max_unread_terminal_runs: "+limit, 1)
+		if _, err := Load(writeConfig(t, body)); err != nil {
+			t.Fatalf("limit %s: %v", limit, err)
+		}
+	}
+	body := strings.Replace(withLimit, "max_unread_terminal_runs: 1", "max_unread_terminal_runs: 1\n      surprise: true", 1)
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "surprise") {
+		t.Fatalf("expected unknown attention field error, got %v", err)
+	}
+}

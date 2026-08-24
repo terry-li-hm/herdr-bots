@@ -120,8 +120,9 @@ func (e *Engine) Evaluate(ctx context.Context, now time.Time) error {
 		localDayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
 		dayStart := localDayStart.UTC()
 		dayEnd := localDayStart.AddDate(0, 0, 1).UTC()
+		guardPaused := false
 		for _, occ := range occurrences {
-			req := store.AcceptRequest{JobID: job.ID, JobConfigRevision: job.Revision, JobRevision: revision, JobEnabled: job.IsEnabled(), OccurrenceKey: occ.Key, Definition: snapshot, Trigger: occ.Trigger, ScheduledFor: occ.ScheduledFor, Overlap: job.Overlap, DayStart: dayStart, DayEnd: dayEnd, MaxRunsPerDay: job.Limits.MaxRunsPerDay, Now: now}
+			req := store.AcceptRequest{JobID: job.ID, JobConfigRevision: job.Revision, JobRevision: revision, JobEnabled: job.IsEnabled(), OccurrenceKey: occ.Key, Definition: snapshot, Trigger: occ.Trigger, ScheduledFor: occ.ScheduledFor, Overlap: job.Overlap, DayStart: dayStart, DayEnd: dayEnd, MaxRunsPerDay: job.Limits.MaxRunsPerDay, MaxUnreadTerminalRuns: job.MaxUnreadTerminalRuns(), Now: now}
 			if occ.Outcome == "missed" {
 				if _, err := e.Store.RecordOccurrenceIfAuthority(ctx, req, "missed", occ.Detail); err != nil {
 					return err
@@ -151,14 +152,26 @@ func (e *Engine) Evaluate(ctx context.Context, now time.Time) error {
 				}
 				req.SourceBaseRevision, req.SourceRevision, req.InputContext = input.BaseRevision, input.Revision, input.Context
 			}
-			if _, err := e.Store.AcceptScheduledOccurrence(ctx, req); err != nil {
-				return err
+			result, acceptErr := e.Store.AcceptScheduledOccurrence(ctx, req)
+			if acceptErr != nil {
+				return acceptErr
+			}
+			if result.Outcome == "paused_unread_limit" {
+				// The unread-work guard paused this job atomically. Stop processing
+				// further due occurrences for this job so the next one cannot reach
+				// the authority fence as ErrJobPaused; pause time stays held and
+				// cursor/completion writes require runnable authority.
+				guardPaused = true
+				break
 			}
 			if job.Schedule.Kind == "once" {
 				if err := e.Store.SetCompletedIfAuthority(ctx, job.ID, job.Revision, revision, true); err != nil {
 					return err
 				}
 			}
+		}
+		if guardPaused {
+			continue
 		}
 		if err := e.Store.SetCursorIfAuthority(ctx, job.ID, job.Revision, revision, now, true); err != nil {
 			return err
@@ -203,7 +216,7 @@ func (e *Engine) Enqueue(ctx context.Context, jobID, eventID string, now time.Ti
 	result, err := e.Store.EnqueueEvent(ctx, store.AcceptRequest{
 		JobID: selected.ID, JobConfigRevision: selected.Revision, JobRevision: revision, JobEnabled: selected.IsEnabled(), OccurrenceKey: "event:" + eventID,
 		Definition: snapshot, Trigger: "event", ScheduledFor: now.UTC(),
-		Overlap: selected.Overlap, DayStart: dayStart, DayEnd: dayEnd, MaxRunsPerDay: selected.Limits.MaxRunsPerDay, Now: now,
+		Overlap: selected.Overlap, DayStart: dayStart, DayEnd: dayEnd, MaxRunsPerDay: selected.Limits.MaxRunsPerDay, MaxUnreadTerminalRuns: selected.MaxUnreadTerminalRuns(), Now: now,
 	})
 	if err != nil {
 		return store.AcceptResult{}, err
@@ -243,7 +256,7 @@ func (e *Engine) RunNow(ctx context.Context, jobID string, canary bool, now time
 	if selected.Schedule.Kind == config.ScheduleEvent && canary {
 		run, err = e.Store.CreateCanaryRun(ctx, selected.ID, revision, snapshot, now)
 	} else {
-		run, err = e.Store.CreateManualRunIfAuthority(ctx, store.AcceptRequest{JobID: selected.ID, JobConfigRevision: selected.Revision, JobRevision: revision, JobEnabled: selected.IsEnabled(), Definition: snapshot, Trigger: "manual", Now: now})
+		run, err = e.Store.CreateManualRunIfAuthority(ctx, store.AcceptRequest{JobID: selected.ID, JobConfigRevision: selected.Revision, JobRevision: revision, JobEnabled: selected.IsEnabled(), Definition: snapshot, Trigger: "manual", MaxUnreadTerminalRuns: selected.MaxUnreadTerminalRuns(), Now: now})
 	}
 	if err != nil {
 		return store.Run{}, err

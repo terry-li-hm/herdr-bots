@@ -269,3 +269,84 @@ func TestAttendedWaitDoesNotCallForeignOwnedRunStalled(t *testing.T) {
 		t.Fatalf("run=%+v", final)
 	}
 }
+
+func TestListReportsPauseReasonWithoutMarkingRead(t *testing.T) {
+	dir := t.TempDir()
+	configPath := writeCLIEventConfig(t, dir, true)
+	// The event job reaches its unread-work guard limit after one unread run.
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body), "    overlap: forbid", "    overlap: forbid\n    attention:\n      max_unread_terminal_runs: 1", 1))
+	if err := os.WriteFile(configPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.db")
+	if err := run([]string{"enqueue", "repair", "--event-id", "guard-1", "--config", configPath, "--state", statePath}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := state.ListRuns(context.Background(), "repair", 10)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	if err := state.Finish(context.Background(), runs[0].ID, store.StateAccepted, store.StateSucceeded, "completed", "completed", "unverified", "", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The next event delivery trips the guard and durably pauses the job.
+	if err := run([]string{"enqueue", "repair", "--event-id", "guard-2", "--config", configPath, "--state", statePath}); err == nil || !strings.Contains(err.Error(), "unread terminal") {
+		t.Fatalf("expected guard pause error, got %v", err)
+	}
+
+	original := os.Stdout
+	var captured []byte
+	read, writeEnd, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatal(pipeErr)
+	}
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := read.Read(buf)
+			captured = append(captured, buf[:n]...)
+			if readErr != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	os.Stdout = writeEnd
+	listErr := run([]string{"list", "--config", configPath, "--state", statePath})
+	os.Stdout = original
+	_ = writeEnd.Close()
+	<-done
+	_ = read.Close()
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if !strings.Contains(string(captured), store.PauseReasonUnreadTerminalRuns) {
+		t.Fatalf("list output did not report the pause reason: %q", captured)
+	}
+
+	state, err = store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	job, err := state.Job(context.Background(), "repair")
+	if err != nil || !job.Paused || job.PauseReason != store.PauseReasonUnreadTerminalRuns {
+		t.Fatalf("job=%+v err=%v", job, err)
+	}
+	runs, err = state.ListRuns(context.Background(), "repair", 10)
+	if err != nil || len(runs) != 1 || !runs[0].Unread {
+		t.Fatalf("list must not mark runs read: runs=%+v err=%v", runs, err)
+	}
+}
