@@ -71,7 +71,7 @@ grep -q 'const Label = "com.terry.herdr-bots"' "$root/internal/service/launchd.g
     fail 'launchd service label must be com.terry.herdr-bots'
 grep -q -- '-o bin/herdr-bots ./cmd/herdr-bots' "$root/Makefile" || \
     fail 'Makefile build target must produce bin/herdr-bots'
-grep -q '^## \[0.2.0\] - 2026-08-24$' "$root/CHANGELOG.md" || \
+grep -q '^## \[0.2.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
     fail 'CHANGELOG.md must carry the dated 0.2.0 entry'
 note 'module, CLI, plugin, and service identities agree'
 
@@ -107,7 +107,7 @@ grep -q 'reported by Pi' "$root/AGENTS.md" || \
     fail 'AGENTS.md must state non-Claude routes are configured/reported by Pi'
 grep -q 'actual release date' "$root/docs/release.md" || \
     fail 'docs/release.md must require setting the actual release date before tag/release'
-grep -q '^## \[0.2.0\] - 2026-08-24$' "$root/CHANGELOG.md" || \
+grep -q '^## \[0.2.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
     fail 'CHANGELOG must carry the dated current 0.2.0 section'
 grep -q '^\[0.2.0\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0$' "$root/CHANGELOG.md" || \
     fail 'CHANGELOG must carry the current 0.2.0 release link'

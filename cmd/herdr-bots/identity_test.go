@@ -107,7 +107,7 @@ func TestReleaseVersionContractsNameCurrentRelease(t *testing.T) {
 	}
 	changelog := read("CHANGELOG.md")
 	for _, want := range []string{
-		"## [0.2.0] - 2026-08-24\n",
+		"## [0.2.0] - 2026-08-25\n",
 		"[0.2.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0",
 		"[0.1.1]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1",
 		"[0.1.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.0",

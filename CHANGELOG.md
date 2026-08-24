@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
-## [0.2.0] - 2026-08-24
+## [0.2.0] - 2026-08-25
 
 macOS prerelease (preview): adds an opt-in unread-terminal-run attention guard
 for jobs. Existing v0.1.x configs remain valid, and the database migration

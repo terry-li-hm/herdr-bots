@@ -20,7 +20,7 @@ prerelease (preview) of Herdr Bots.
 | 9 | Examples ship disabled | Every job in `bots.example.yaml` declares `enabled: false`; example route values are labelled as examples | `assays/release-gate.sh` |
 | 10 | No private/internal identity strings | Tracked tree greps clean for forbidden identity strings; public owner strings (`Terry Li`, `terry-li-hm`, `Thomas Legrand`) remain valid | `assays/release-gate.sh` |
 | 11 | CI evidence | `.github/workflows/ci.yml` runs `make check` only on macOS with read-only repository permissions, the `go.mod` Go version, and the verified current `actions/checkout@v7` and `actions/setup-go@v7` majors. The first hosted Ubuntu run failed to compile the macOS-only engine (`unix.RenameatxNp` and `unix.RENAME_EXCL`), so no Linux build or test evidence is claimed. | workflow definition + hosted CI result |
-| 12 | Changelog dating | The CHANGELOG 0.2.0 entry carries the actual release date `2026-08-24`, not `Unreleased`, in the same commit that will be tagged; the dated 0.1.1 and 0.1.0 sections and links remain historical | `assays/release-gate.sh` + release operator |
+| 12 | Changelog dating | The CHANGELOG 0.2.0 entry carries the actual release date `2026-08-25`, not `Unreleased`, in the same commit that will be tagged; the dated 0.1.1 and 0.1.0 sections and links remain historical | `assays/release-gate.sh` + release operator |
 | 13 | Lineage hygiene | The exact release candidate commit descends from the published v0.1.1 tag, and the incremental `v0.1.1..HEAD` range was reviewed before tagging; no history rewrite occurs | release operator |
 | 14 | Config admission | Go tests cover exact mode, symlink and non-regular rejection; wrong-owner rejection runs only where the test process can create a genuinely different owner. The implementation and public policy pin no-follow/close-on-exec descriptor admission, regular-file/effective-UID/exact-0600 checks, and final path/inode equality. macOS ACLs are not inspected and must not grant others access. | `go test` + code/policy review |
 | 15 | Herdr error-channel patch | Focused tests prove failed Herdr commands parse structured API errors from stdout or stderr, preserve plain stderr fallback, and retry an agent wait after a timeout envelope on stderr | `go test -race ./internal/herdr` |
@@ -45,7 +45,7 @@ check`, the release gate, or CI performs or authorizes:
 1. Confirm every row of the evidence matrix on the exact commit intended for
    release.
 2. Confirm the CHANGELOG 0.2.0 entry has the actual release date
-   `2026-08-24`, is not `Unreleased`, and preserves the 0.1.1 and 0.1.0
+   `2026-08-25`, is not `Unreleased`, and preserves the 0.1.1 and 0.1.0
    sections and links.
 3. Confirm the exact candidate commit descends from the published v0.1.1
    tag and that the incremental `v0.1.1..HEAD` range was reviewed (no
