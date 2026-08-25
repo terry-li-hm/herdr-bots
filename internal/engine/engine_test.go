@@ -3058,6 +3058,207 @@ func waitForProcessGroupMembers(t *testing.T, pgid, want int) {
 	}
 }
 
+// recordedGroupSignal is one signal the termination path asked the kernel for.
+type recordedGroupSignal struct {
+	pgid int
+	sig  syscall.Signal
+}
+
+// fakeProcessGroup stands in for the kernel-facing steps of group termination:
+// membership is answered from a scripted sequence, whose last answer repeats,
+// and every signal is recorded before an optional delegate performs it. It
+// exists because the orderings that matter here -- a group emptied between the
+// observation and the kill, a group number that already belongs to somebody
+// else -- cannot be produced on demand from a real process table.
+type fakeProcessGroup struct {
+	mu       sync.Mutex
+	counts   []int
+	countErr error
+	signals  []recordedGroupSignal
+	kill     func(pgid int, sig syscall.Signal) error
+}
+
+func (f *fakeProcessGroup) observe(int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
+	count := f.counts[0]
+	if len(f.counts) > 1 {
+		f.counts = f.counts[1:]
+	}
+	return count, nil
+}
+
+func (f *fakeProcessGroup) signal(pgid int, sig syscall.Signal) error {
+	f.mu.Lock()
+	f.signals = append(f.signals, recordedGroupSignal{pgid: pgid, sig: sig})
+	kill := f.kill
+	f.mu.Unlock()
+	if kill != nil {
+		return kill(pgid, sig)
+	}
+	return nil
+}
+
+func (f *fakeProcessGroup) recorded() []recordedGroupSignal {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedGroupSignal(nil), f.signals...)
+}
+
+func (f *fakeProcessGroup) install(t *testing.T) *fakeProcessGroup {
+	t.Helper()
+	observe, signal := observeProcessGroupMembers, signalProcessGroup
+	observeProcessGroupMembers, signalProcessGroup = f.observe, f.signal
+	t.Cleanup(func() { observeProcessGroupMembers, signalProcessGroup = observe, signal })
+	return f
+}
+
+// A group the table already lists no owned member of is never signalled: the
+// number may have been emptied or reused, and killing it would address whatever
+// group inherits it next.
+func TestVerifierGroupTerminationNeverSignalsAnEmptyGroup(t *testing.T) {
+	seam := (&fakeProcessGroup{counts: []int{0}}).install(t)
+	if err := terminateVerifierProcessGroup(4242); err != nil {
+		t.Fatalf("terminating a group with no owned members failed: %v", err)
+	}
+	if got := seam.recorded(); len(got) != 0 {
+		t.Fatalf("empty group was signalled: %+v", got)
+	}
+}
+
+func TestVerifierGroupTerminationSignalsOwnedMembersExactlyOnce(t *testing.T) {
+	seam := (&fakeProcessGroup{counts: []int{2, 0}}).install(t)
+	if err := terminateVerifierProcessGroup(4242); err != nil {
+		t.Fatalf("terminate verifier process group: %v", err)
+	}
+	want := recordedGroupSignal{pgid: 4242, sig: syscall.SIGKILL}
+	if got := seam.recorded(); len(got) != 1 || got[0] != want {
+		t.Fatalf("signals=%+v want exactly one %+v", got, want)
+	}
+}
+
+// EPERM and ESRCH say only that the signal did not land. What the group is
+// afterwards is read from the table, and owned members left in it still fail.
+func TestVerifierGroupKillErrorsAreResolvedByTheProcessTable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		killErr error
+		counts  []int
+		wantErr bool
+	}{
+		{name: "eperm once the group is empty", killErr: syscall.EPERM, counts: []int{1, 0}},
+		{name: "esrch once the group is empty", killErr: syscall.ESRCH, counts: []int{1, 0}},
+		{name: "eperm while owned members remain", killErr: syscall.EPERM, counts: []int{1, 1}, wantErr: true},
+		{name: "esrch while owned members remain", killErr: syscall.ESRCH, counts: []int{1, 1}, wantErr: true},
+		{name: "any other kill error", killErr: syscall.EINVAL, counts: []int{1, 0}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seam := (&fakeProcessGroup{counts: tc.counts, kill: func(int, syscall.Signal) error { return tc.killErr }}).install(t)
+			err := terminateVerifierProcessGroup(4242)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if got := seam.recorded(); len(got) != 1 {
+				t.Fatalf("signals=%+v; the group must be signalled exactly once", got)
+			}
+		})
+	}
+}
+
+// An unreadable table is never absence: nothing may be concluded about the
+// group from it, and the termination fails without signalling anything.
+func TestVerifierGroupTerminationFailsWhenTheProcessTableCannotBeRead(t *testing.T) {
+	seam := (&fakeProcessGroup{counts: []int{0}, countErr: errors.New("ps: injected failure")}).install(t)
+	err := terminateVerifierProcessGroup(4242)
+	if err == nil || !strings.Contains(err.Error(), "injected failure") {
+		t.Fatalf("err=%v", err)
+	}
+	if got := seam.recorded(); len(got) != 0 {
+		t.Fatalf("unreadable table still signalled the group: %+v", got)
+	}
+}
+
+// Cancellation observes before it signals for the same reason termination does,
+// and still publishes nothing.
+func TestCancelledVerifierNeverSignalsAnEmptyGroup(t *testing.T) {
+	eng, state, _ := newTestEngine(t, true, "")
+	claim := "66666666666666666666666666666666"
+	receipt, err := state.VerifierReceiptPath(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.prepareVerifierReceipt(claim, receipt); err != nil {
+		t.Fatal(err)
+	}
+	seam := (&fakeProcessGroup{counts: []int{0}}).install(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The verifier ends on its own, so an unsignalled group is still reaped and
+	// the cancellation path is what returns.
+	code, detail, err := eng.runVerifierCommand(ctx, t.TempDir(), receipt, claim, []string{"/bin/sh", "-c", "sleep 1"})
+	if !errors.Is(err, context.Canceled) || code != -1 {
+		t.Fatalf("code=%d detail=%q err=%v", code, detail, err)
+	}
+	if got := seam.recorded(); len(got) != 0 {
+		t.Fatalf("cancellation signalled a group with no owned members: %+v", got)
+	}
+	for _, path := range []string{receipt, receipt + ".output", receipt + ".tmp"} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cancelled verifier published %s: %v", path, err)
+		}
+	}
+}
+
+func TestCancelledVerifierSignalsOwnedMembersExactlyOnce(t *testing.T) {
+	eng, state, _ := newTestEngine(t, true, "")
+	claim := "77777777777777777777777777777777"
+	receipt, err := state.VerifierReceiptPath(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.prepareVerifierReceipt(claim, receipt); err != nil {
+		t.Fatal(err)
+	}
+	// Membership is scripted, but the signal is real: the long verifier only ends
+	// because the one recorded kill reaches it.
+	seam := (&fakeProcessGroup{counts: []int{2, 0}, kill: func(pgid int, sig syscall.Signal) error {
+		return syscall.Kill(-pgid, sig)
+	}}).install(t)
+	// No path through this test may leave the group behind.
+	t.Cleanup(func() {
+		for _, sent := range seam.recorded() {
+			_ = syscall.Kill(-sent.pgid, syscall.SIGKILL)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	type verifierResult struct {
+		code int
+		err  error
+	}
+	results := make(chan verifierResult, 1)
+	go func() {
+		code, _, err := eng.runVerifierCommand(ctx, t.TempDir(), receipt, claim, []string{"/bin/sh", "-c", "sleep 300"})
+		results <- verifierResult{code: code, err: err}
+	}()
+	var got verifierResult
+	select {
+	case got = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled verifier never returned")
+	}
+	if !errors.Is(got.err, context.Canceled) || got.code != -1 {
+		t.Fatalf("code=%d err=%v", got.code, got.err)
+	}
+	sent := seam.recorded()
+	if len(sent) != 1 || sent[0].sig != syscall.SIGKILL || sent[0].pgid <= 1 {
+		t.Fatalf("signals=%+v; the cancelled group must be signalled exactly once", sent)
+	}
+}
+
 func TestProcessTableRowsAreParsedStrictly(t *testing.T) {
 	rows, err := parseProcessTable([]byte("  501   500   501\n1 1 0\n\n"))
 	if err != nil {

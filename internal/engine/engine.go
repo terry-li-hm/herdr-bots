@@ -1290,15 +1290,15 @@ exit($status >> 8);`
 	case waitErr = <-done:
 	case <-ctx.Done():
 		// Cancellation ends the invocation the same way completion does: the group
-		// this scheduler started is signalled once and then proven absent from the
-		// process table before the call returns, so an abandoned verifier cannot
-		// leave descendants writing into the worktree. terminateVerifierProcessGroup
-		// is deliberately not called here, because it would signal the same group a
-		// second time.
+		// this scheduler started is observed, signalled at most once, and then
+		// proven absent from the process table before the call returns, so an
+		// abandoned verifier cannot leave descendants writing into the worktree.
+		// terminateVerifierProcessGroup is deliberately not called here, because it
+		// would observe and signal the same group a second time.
 		reason := ctx.Err()
 		var cleanupErr error
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			cleanupErr = fmt.Errorf("kill verifier process group %d: %w", cmd.Process.Pid, err)
+		if _, err := killVerifierProcessGroupOnce(cmd.Process.Pid); err != nil {
+			cleanupErr = err
 		}
 		<-done
 		if err := waitVerifierProcessGroupGone(cmd.Process.Pid); err != nil {
@@ -1350,20 +1350,69 @@ exit($status >> 8);`
 	return exitCode, detail, nil
 }
 
-// terminateVerifierProcessGroup removes the processes the scheduler itself
-// started for one verifier invocation: the group is signalled once and then
-// observed until no member of it remains. The signal is sent exactly once. A
-// second kill aimed at a group the kernel has already emptied would address
-// whatever new group inherits that number next, so the only thing this does
-// after the initial kill is look. Cancellation sends its own single signal and
-// then looks through waitVerifierProcessGroupGone directly, for the same reason.
-// This never touches workspace content.
-func terminateVerifierProcessGroup(pgid int) error {
+// The process table and the group signal are the two kernel-facing steps of
+// verifier termination. They are indirected so a test can present an ordering
+// the machine it runs on cannot be asked to produce on demand: a group emptied
+// between the observation and the signal, or a group number that already
+// belongs to somebody else.
+var (
+	observeProcessGroupMembers = countProcessGroupMembers
+	signalProcessGroup         = func(pgid int, sig syscall.Signal) error { return syscall.Kill(-pgid, sig) }
+)
+
+// killVerifierProcessGroupOnce looks before it signals, and signals at most
+// once. A group the kernel has already emptied, or one whose number now belongs
+// to another user, is nothing this invocation started, so it is not signalled at
+// all: the kill that would be aimed at it addresses whatever group inherits that
+// number next, and on macOS it answers EPERM about a group that is simply gone.
+// The returned flag says whether the group was already proven empty, so a caller
+// can tell a group it really did signal, and must therefore watch, from one
+// there was never anything to watch.
+//
+// EPERM and ESRCH from the kill are not conclusions either; both only say the
+// signal did not land. Membership is read again and absence is concluded solely
+// from a table that lists no owned member. Every other kill error, and any table
+// that cannot be read, fails: a group with owned members left in it is never
+// reported as terminated.
+func killVerifierProcessGroupOnce(pgid int) (bool, error) {
 	if pgid <= 1 {
-		return fmt.Errorf("refusing to signal verifier process group %d", pgid)
+		return false, fmt.Errorf("refusing to signal verifier process group %d", pgid)
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill verifier process group %d: %w", pgid, err)
+	members, err := observeProcessGroupMembers(pgid)
+	if err != nil {
+		return false, fmt.Errorf("observe verifier process group %d: %w", pgid, err)
+	}
+	if members == 0 {
+		return true, nil
+	}
+	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+	if killErr == nil {
+		return false, nil
+	}
+	if !errors.Is(killErr, syscall.EPERM) && !errors.Is(killErr, syscall.ESRCH) {
+		return false, fmt.Errorf("kill verifier process group %d: %w", pgid, killErr)
+	}
+	remaining, err := observeProcessGroupMembers(pgid)
+	if err != nil {
+		return false, fmt.Errorf("observe verifier process group %d after kill %v: %w", pgid, killErr, err)
+	}
+	if remaining != 0 {
+		return false, fmt.Errorf("kill verifier process group %d: %w; %d member(s) remain", pgid, killErr, remaining)
+	}
+	return true, nil
+}
+
+// terminateVerifierProcessGroup removes the processes the scheduler itself
+// started for one verifier invocation: the group is observed, signalled once if
+// this user still owns a member of it, and then observed again until no member
+// remains. A group that was already empty when it was first read is a success
+// that signals nothing. Cancellation performs the same single observation and
+// signal itself, and then looks through waitVerifierProcessGroupGone directly,
+// for the same reason. This never touches workspace content.
+func terminateVerifierProcessGroup(pgid int) error {
+	gone, err := killVerifierProcessGroupOnce(pgid)
+	if err != nil || gone {
+		return err
 	}
 	return waitVerifierProcessGroupGone(pgid)
 }
@@ -1385,7 +1434,7 @@ func terminateVerifierProcessGroup(pgid int) error {
 func waitVerifierProcessGroupGone(pgid int) error {
 	deadline := time.Now().Add(verifierGroupKillLimit)
 	for {
-		members, err := countProcessGroupMembers(pgid)
+		members, err := observeProcessGroupMembers(pgid)
 		if err != nil {
 			return fmt.Errorf("observe verifier process group %d: %w", pgid, err)
 		}
