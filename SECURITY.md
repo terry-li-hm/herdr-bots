@@ -62,7 +62,10 @@ acknowledgement; fixes ship through the normal release process described in
   Herdr's screen detector may briefly retain a stale Pi label even when the
   pane foreground is the shell; label clearance is not immediate. Completed
   workspaces remain shell-only review surfaces and are not auto-closed or
-  deleted.
+  deleted. Automatic closure is deliberately excluded because Herdr has no
+  input fence that makes pane transcript capture atomic; closing a workspace
+  can otherwise destroy unread output that arrives after capture. Closure
+  remains an explicit post-review action.
 - Manual pause (global or per job), run cancellation, launchd service
   unload, and worktree cleanup are always available and never automated away.
 - The scheduler has no automatic retry, no automatic deletion, and no push,
