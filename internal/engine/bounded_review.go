@@ -51,6 +51,16 @@ import (
 // the scope already allows produces different bytes and is refused as the
 // conflict it is.
 //
+// The observation is taken twice before any of it is persisted. Both passes are
+// complete ones: enumerate, exclude the staged inputs, prove the reserved
+// subtree, prove the declared scope, fingerprint. The receipt is written only
+// when the second pass reproduces the first path for path and field for field,
+// because a receipt built from an enumeration taken at one instant and content
+// read at another would describe a worktree that never existed at either.
+// Refusing that is still not containment: the second pass buys confidence that
+// the receipt names one settled state of the worktree, not that the worktree
+// was the only thing the run could reach.
+//
 // Nothing here ever deletes a staged input. Retaining the worktree is
 // deliberate: it is disposable evidence, so a run that succeeded and a run that
 // failed halfway both leave behind exactly what they read, and an operator can
@@ -352,9 +362,10 @@ func openBoundedSource(source string) (unix.Stat_t, *os.File, error) {
 }
 
 // verifyBoundedReview proves the run stayed inside its declared boundary and
-// persists the change receipt for a scoped job. A run with neither a staged
-// input receipt nor a declared write scope has no boundary to prove, so it is
-// left exactly as it was before either field existed.
+// persists the change receipt for a scoped job. The proof is taken twice, and
+// the receipt describes a worktree both passes agreed on. A run with neither a
+// staged input receipt nor a declared write scope has no boundary to prove, so
+// it is left exactly as it was before either field existed.
 func (e *Engine) verifyBoundedReview(ctx context.Context, run store.Run, job config.Job) (string, error) {
 	if run.InputReceipt == "" && !job.Execution.HasWriteScope() {
 		return "", nil
@@ -377,28 +388,13 @@ func (e *Engine) verifyBoundedReview(ctx context.Context, run store.Run, job con
 		excluded[destination] = struct{}{}
 	}
 
-	changed, untracked, err := boundedRepositoryChanges(ctx, root)
+	// The reserved subtree is proven inside the enumeration, before any verdict
+	// is persisted. A run that planted its own file among the immutable
+	// snapshots must never leave behind a receipt saying its writes were within
+	// scope.
+	firstRemaining, firstUntracked, err := boundedEnumerateChanges(ctx, root, excluded)
 	if err != nil {
 		return "", err
-	}
-	remaining := make([]string, 0, len(changed))
-	for _, path := range changed {
-		if _, ok := excluded[path]; ok {
-			continue
-		}
-		remaining = append(remaining, path)
-	}
-
-	// The reserved subtree is checked before any verdict is persisted. A run
-	// that planted its own file among the immutable snapshots must never leave
-	// behind a receipt saying its writes were within scope.
-	for _, path := range untracked {
-		if _, ok := excluded[path]; ok {
-			continue
-		}
-		if boundedIsReservedPath(path) {
-			return "", fmt.Errorf("bounded review: stage=reserved-inputs path=%s: untracked file under %s is not a staged input", path, config.BoundedInputsDir)
-		}
 	}
 
 	if !job.Execution.HasWriteScope() {
@@ -409,28 +405,53 @@ func (e *Engine) verifyBoundedReview(ctx context.Context, run store.Run, job con
 
 	allowed := append([]string(nil), job.Execution.AllowedWritePaths...)
 	sort.Strings(allowed)
-	offending := make([]string, 0)
-	for _, path := range remaining {
-		if !boundedWriteAllowed(path, allowed) {
-			offending = append(offending, path)
-		}
-	}
-	if len(offending) > 0 {
-		return "", fmt.Errorf("bounded review: stage=write-scope: %d changed path(s) are outside the declared write scope: %s", len(offending), formatOffendingPaths(offending))
+	if err := boundedCheckWriteScope(firstRemaining, allowed); err != nil {
+		return "", err
 	}
 
 	// Content is fingerprinted after the scope check, so nothing outside the
-	// declared boundary is ever opened or read, and before the receipt is
-	// encoded, so the durable bytes describe a worktree that was observed whole.
-	states, err := boundedObserveChangedPaths(root, remaining)
+	// declared boundary is ever opened or read.
+	states, err := boundedObserveChangedPaths(root, firstRemaining)
 	if err != nil {
 		return "", err
 	}
+
+	if boundedBetweenPassesRace != nil {
+		boundedBetweenPassesRace()
+	}
+
+	// The second complete pass is what makes the first one a description of the
+	// worktree rather than of a moment inside it. It re-enumerates, re-excludes
+	// the same staged destinations, and reproves both policies from scratch, so
+	// a change that arrived after the first pass is judged rather than inherited;
+	// only then are the two passes compared, and only a pass that agrees with its
+	// predecessor on every path and every field is persisted.
+	secondRemaining, secondUntracked, err := boundedEnumerateChanges(ctx, root, excluded)
+	if err != nil {
+		return "", err
+	}
+	if err := boundedCheckWriteScope(secondRemaining, allowed); err != nil {
+		return "", err
+	}
+	if !boundedSamePaths(firstRemaining, secondRemaining) || !boundedSamePaths(firstUntracked, secondUntracked) {
+		return "", errors.New("bounded review: stage=stability: repository changed during boundary observation: the two passes enumerated different paths")
+	}
+	restated, err := boundedObserveChangedPaths(root, secondRemaining)
+	if err != nil {
+		return "", err
+	}
+	if !boundedSameStates(states, restated) {
+		return "", errors.New("bounded review: stage=stability: repository changed during boundary observation: the two passes fingerprinted different content")
+	}
+
+	// The receipt records the second pass. Both describe the same worktree by
+	// now, and the later one is the one that was still true when the encoding
+	// began.
 	payload, err := json.Marshal(boundedChangeReceipt{
 		Version:           boundedReceiptVersion,
 		AllowedWritePaths: allowed,
-		ChangedPaths:      remaining,
-		States:            states,
+		ChangedPaths:      secondRemaining,
+		States:            restated,
 		Verdict:           boundedVerdictWithinScope,
 	})
 	if err != nil {
@@ -444,6 +465,74 @@ func (e *Engine) verifyBoundedReview(ctx context.Context, run store.Run, job con
 	// receipt and the disposable worktree can still be checked against each
 	// other afterwards.
 	return string(payload), nil
+}
+
+// boundedBetweenPassesRace is nil in production. Like the per-path seams
+// elsewhere in this file it exists so a test can open the window the second
+// pass is about: it is called once, after the first complete pass has been
+// fingerprinted and before the second enumeration starts, which is exactly
+// where a run that had not really stopped would land.
+var boundedBetweenPassesRace func()
+
+// boundedEnumerateChanges is one complete enumeration of the worktree with the
+// policies that do not depend on content already applied: staged inputs are
+// excluded from the change set, and nothing else may sit under the reserved
+// subtree. Both passes go through here so neither can enumerate or exclude on
+// terms of its own. The returned paths inherit the sorted order git's
+// enumeration was reduced to, which is what lets two passes be compared
+// position for position.
+func boundedEnumerateChanges(ctx context.Context, root string, excluded map[string]struct{}) ([]string, []string, error) {
+	changed, untracked, err := boundedRepositoryChanges(ctx, root)
+	if err != nil {
+		return nil, nil, err
+	}
+	remaining := make([]string, 0, len(changed))
+	for _, path := range changed {
+		if _, ok := excluded[path]; ok {
+			continue
+		}
+		remaining = append(remaining, path)
+	}
+	for _, path := range untracked {
+		if _, ok := excluded[path]; ok {
+			continue
+		}
+		if boundedIsReservedPath(path) {
+			return nil, nil, fmt.Errorf("bounded review: stage=reserved-inputs path=%s: untracked file under %s is not a staged input", path, config.BoundedInputsDir)
+		}
+	}
+	return remaining, untracked, nil
+}
+
+// boundedSamePaths reports whether two passes enumerated exactly the same
+// paths in exactly the same order.
+func boundedSamePaths(first, second []string) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// boundedSameStates reports whether two passes fingerprinted exactly the same
+// content. Every field of a state participates: the comparison is the struct's
+// own, so a field added to boundedPathState is compared here without this
+// having to be revisited, and a state that differs in any of them describes a
+// worktree that moved between the passes.
+func boundedSameStates(first, second []boundedPathState) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // verifyStagedInputs reproves every staged input named by the durable receipt
@@ -1041,6 +1130,22 @@ func boundedReviewPrompt(base string, job config.Job, inputReceipt string) strin
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
 	return strings.TrimSpace(base) + "\n\n" + strings.Join(sections, "\n\n")
+}
+
+// boundedCheckWriteScope refuses a change set that leaves the declared scope.
+// Both passes call it, so a path that appeared after the first one is judged by
+// the same rule rather than carried in on the strength of an earlier verdict.
+func boundedCheckWriteScope(changed, allowed []string) error {
+	offending := make([]string, 0)
+	for _, path := range changed {
+		if !boundedWriteAllowed(path, allowed) {
+			offending = append(offending, path)
+		}
+	}
+	if len(offending) > 0 {
+		return fmt.Errorf("bounded review: stage=write-scope: %d changed path(s) are outside the declared write scope: %s", len(offending), formatOffendingPaths(offending))
+	}
+	return nil
 }
 
 // boundedWriteAllowed matches a changed path against the declared scope. An

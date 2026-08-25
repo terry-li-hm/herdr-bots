@@ -32,6 +32,8 @@ const (
 	workspaceCloseLease        = time.Minute
 	workspaceStatusLimit       = 10 * time.Second
 	verifierLease              = 6 * time.Minute
+	verifierGroupKillLimit     = 2 * time.Second
+	verifierGroupPollInterval  = 2 * time.Millisecond
 )
 
 var (
@@ -1291,6 +1293,14 @@ exit($status >> 8);`
 		<-done
 		return -1, "", ctx.Err()
 	}
+	// A verifier may be unrestricted, so its own exit proves nothing about the
+	// descendants it left behind. The group it owns is killed and proven gone
+	// here, before any result is read or published, so no process the verifier
+	// started can still be writing into the worktree while the post-verifier
+	// boundary is observed. Failure leaves the result unpublished.
+	if err := terminateVerifierProcessGroup(cmd.Process.Pid); err != nil {
+		return -1, "", fmt.Errorf("%w: %v", errVerifierReceiptProtocol, err)
+	}
 	if err := outputFile.Sync(); err != nil {
 		return -1, "", fmt.Errorf("%w: sync output: %v", errVerifierReceiptProtocol, err)
 	}
@@ -1319,6 +1329,165 @@ exit($status >> 8);`
 	}
 	published = true
 	return exitCode, detail, nil
+}
+
+// terminateVerifierProcessGroup removes the processes the scheduler itself
+// started for one verifier invocation: the group is signalled once and then
+// observed until no member of it remains. The signal is sent exactly once. A
+// second kill aimed at a group the kernel has already emptied would address
+// whatever new group inherits that number next, so the only thing this does
+// after the initial kill is look.
+//
+// Looking means reading the process table, not probing the group with signal
+// zero. A zero-signal probe answers with this process's permission to signal
+// the group rather than with the group's existence, and macOS answers EPERM for
+// a group whose last member the very same kill removed. An absence proof must
+// not read that as a survivor, so the question is asked of the table instead:
+// how many processes does the kernel currently list in this group that this
+// user owns. Ownership is part of the question because a group number reused by
+// another user is not a descendant of anything this scheduler started.
+//
+// The deadline is wall-clock and short. Timing out, a ps that fails, and a
+// table that does not parse are all errors, never an assumption that the group
+// died: absence is only ever concluded from a table that was read and
+// understood. This never touches workspace content.
+func terminateVerifierProcessGroup(pgid int) error {
+	if pgid <= 1 {
+		return fmt.Errorf("refusing to signal verifier process group %d", pgid)
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill verifier process group %d: %w", pgid, err)
+	}
+	deadline := time.Now().Add(verifierGroupKillLimit)
+	for {
+		members, err := countProcessGroupMembers(pgid)
+		if err != nil {
+			return fmt.Errorf("observe verifier process group %d: %w", pgid, err)
+		}
+		if members == 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("verifier process group %d still has %d member(s) after %s", pgid, members, verifierGroupKillLimit)
+		}
+		time.Sleep(verifierGroupPollInterval)
+	}
+}
+
+const (
+	// The process table is read into memory before any of it is trusted, so the
+	// snapshot carries the same bounds the repository enumeration does. Stderr
+	// is kept only to name a ps failure.
+	maxProcessTableBytes       = 4 << 20
+	maxProcessTableStderrBytes = 4 << 10
+)
+
+// processTableRow is one process the kernel listed: its own id, the group it
+// belongs to, and the user it runs as.
+type processTableRow struct {
+	pid  int
+	pgid int
+	uid  int
+}
+
+// countProcessGroupMembers counts the processes the kernel currently lists in
+// pgid that this user owns.
+func countProcessGroupMembers(pgid int) (int, error) {
+	rows, err := readProcessTable()
+	if err != nil {
+		return 0, err
+	}
+	uid := os.Geteuid()
+	members := 0
+	for _, row := range rows {
+		if row.pgid == pgid && row.uid == uid {
+			members++
+		}
+	}
+	return members, nil
+}
+
+// readProcessTable takes one snapshot of the process table. ps is invoked
+// directly with fixed arguments and no shell, its retained output is bounded,
+// and it is given a deadline of its own, so neither an unresponsive nor a noisy
+// ps can stall or flood the observation that reads it.
+func readProcessTable() ([]processTableRow, error) {
+	psCtx, cancel := context.WithTimeout(context.Background(), verifierGroupKillLimit)
+	defer cancel()
+	cmd := exec.CommandContext(psCtx, "/bin/ps", "-axo", "pid=,pgid=,uid=")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderr := &boundedStderrWriter{limit: maxProcessTableStderrBytes}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, maxProcessTableBytes+1))
+	exceeded := len(output) > maxProcessTableBytes
+	if exceeded {
+		_ = cmd.Process.Kill()
+	}
+	// Draining guarantees ps can never block writing into a pipe nobody is
+	// reading, so Wait always returns.
+	_, _ = io.Copy(io.Discard, stdout)
+	waitErr := cmd.Wait()
+	switch {
+	case exceeded:
+		return nil, fmt.Errorf("ps produced more than %d bytes of output", int64(maxProcessTableBytes))
+	case readErr != nil:
+		return nil, fmt.Errorf("ps: read output: %w", readErr)
+	case waitErr != nil:
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = waitErr.Error()
+		}
+		return nil, fmt.Errorf("ps: %s", message)
+	}
+	rows, err := parseProcessTable(output)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		// ps lists at least itself, so an empty snapshot is a ps that answered
+		// something other than the question. Concluding absence from it would be
+		// concluding it from nothing.
+		return nil, errors.New("ps listed no processes at all")
+	}
+	return rows, nil
+}
+
+// parseProcessTable reads the header-suppressed numeric columns ps was asked
+// for. Every non-empty row must be exactly three integers: a row that is
+// anything else is refused rather than skipped, because a skipped row is a
+// process the count would silently claim does not exist. Ids and group numbers
+// are never negative, so a negative one is a row that was not understood. A
+// user id is: macOS reports uid -2 for processes running as nobody, and such a
+// row is a real process that is simply not this user's, so it is parsed as the
+// signed value it is and left for the count to exclude, since no negative uid
+// can equal os.Geteuid.
+func parseProcessTable(output []byte) ([]processTableRow, error) {
+	rows := make([]processTableRow, 0, 256)
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("process table row %q does not have exactly three columns", line)
+		}
+		var values [3]int
+		for i, field := range fields {
+			value, err := strconv.Atoi(field)
+			if err != nil || (value < 0 && i != 2) {
+				return nil, fmt.Errorf("process table row %q has a non-numeric column %q", line, field)
+			}
+			values[i] = value
+		}
+		rows = append(rows, processTableRow{pid: values[0], pgid: values[1], uid: values[2]})
+	}
+	return rows, nil
 }
 
 func verifierExitCode(cmd *exec.Cmd, waitErr error) (int, error) {

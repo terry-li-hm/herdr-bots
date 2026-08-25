@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -2886,6 +2887,167 @@ func TestVerifierSupervisorKillsBackgroundDescendants(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("background verifier descendant escaped supervision: %v", err)
+	}
+}
+
+func TestVerifierWaitsForBackgroundDescendantsBeforeReturning(t *testing.T) {
+	eng, state, _ := newTestEngine(t, true, "")
+	claim := "44444444444444444444444444444444"
+	receipt, err := state.VerifierReceiptPath(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.prepareVerifierReceipt(claim, receipt); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	// No path through this test may leave the long sleeper behind.
+	t.Cleanup(func() {
+		if pid, ok := recordedPID(pidPath); ok {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	// The verifier exits successfully while a child it started is still sleeping,
+	// publishing that child's pid before it goes.
+	command := []string{"/bin/sh", "-c", "sleep 300 & printf '%d\\n' \"$!\" > " + shellQuote(pidPath) + "; exit 0"}
+	code, _, err := eng.runVerifierCommand(context.Background(), t.TempDir(), receipt, claim, command)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	pid := waitForRecordedPID(t, pidPath)
+	// The group kill is synchronous, so the descendant is already gone the first
+	// time it is observed: nothing the verifier owns can still be writing into
+	// the worktree while the post-verifier boundary is observed. Absence is read
+	// from the process table rather than from Kill(pid, 0), which on macOS can
+	// answer EPERM about a process that is already gone.
+	if sameUserProcessListed(t, pid) {
+		t.Fatalf("verifier returned while background descendant %d was still listed", pid)
+	}
+	receiptCode, _, err := eng.readVerifierReceiptFiles(receipt, claim)
+	if err != nil || receiptCode != 0 {
+		t.Fatalf("verifier receipt code=%d err=%v", receiptCode, err)
+	}
+}
+
+// sameUserProcessListed reports whether the process table still lists pid under
+// this user.
+func sameUserProcessListed(t *testing.T, pid int) bool {
+	t.Helper()
+	rows, err := readProcessTable()
+	if err != nil {
+		t.Fatalf("read process table: %v", err)
+	}
+	uid := os.Geteuid()
+	for _, row := range rows {
+		if row.pid == pid && row.uid == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// A group emptied by the kill and a group that was already empty are the same
+// success, and neither may depend on what signal zero would have answered about
+// the group afterwards.
+func TestVerifierGroupTerminationProvesAbsenceFromProcessTable(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "sleep 300 & sleep 300")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := cmd.Process.Pid
+	// No path through this test may leave the group behind, and the leader must
+	// be reaped or its zombie would remain listed in the group forever.
+	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	reaped := make(chan struct{})
+	go func() { defer close(reaped); _, _ = cmd.Process.Wait() }()
+	waitForProcessGroupMembers(t, pgid, 2)
+
+	if err := terminateVerifierProcessGroup(pgid); err != nil {
+		t.Fatalf("terminate verifier process group: %v", err)
+	}
+	members, err := countProcessGroupMembers(pgid)
+	if err != nil || members != 0 {
+		t.Fatalf("group %d has %d member(s) after a successful termination: err=%v", pgid, members, err)
+	}
+	select {
+	case <-reaped:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("group leader %d was never reaped", pgid)
+	}
+	// A second termination of the same, now empty, group is still a success:
+	// nothing about it may turn on this process's permission to signal it.
+	if err := terminateVerifierProcessGroup(pgid); err != nil {
+		t.Fatalf("terminating an already empty group failed: %v", err)
+	}
+}
+
+func waitForProcessGroupMembers(t *testing.T, pgid, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		members, err := countProcessGroupMembers(pgid)
+		if err != nil {
+			t.Fatalf("count process group members: %v", err)
+		}
+		if members >= want {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("process group %d reached only %d of %d members", pgid, members, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestProcessTableRowsAreParsedStrictly(t *testing.T) {
+	rows, err := parseProcessTable([]byte("  501   500   501\n1 1 0\n\n"))
+	if err != nil {
+		t.Fatalf("valid table: %v", err)
+	}
+	want := []processTableRow{{pid: 501, pgid: 500, uid: 501}, {pid: 1, pgid: 1, uid: 0}}
+	if len(rows) != len(want) || rows[0] != want[0] || rows[1] != want[1] {
+		t.Fatalf("rows=%+v want=%+v", rows, want)
+	}
+	// Anything the columns were not promised to be fails the observation rather
+	// than being skipped, because a skipped row is a process the count would
+	// silently claim does not exist.
+	for _, malformed := range []string{
+		"501 500\n",
+		"501 500 501 extra\n",
+		"501 500 root\n",
+		"-1 500 501\n",
+		"501 <defunct> 501\n",
+	} {
+		if _, err := parseProcessTable([]byte(malformed)); err == nil {
+			t.Fatalf("parser accepted malformed table %q", malformed)
+		}
+	}
+}
+
+func recordedPID(path string) (int, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		return 0, false
+	}
+	return pid, true
+}
+
+func waitForRecordedPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if pid, ok := recordedPID(path); ok {
+			return pid
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("verifier recorded no background descendant pid at %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

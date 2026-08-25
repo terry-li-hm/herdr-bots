@@ -833,6 +833,81 @@ func TestVerifyBoundedReviewRefusesAPathRewrittenDuringFingerprint(t *testing.T)
 	}
 }
 
+// A worktree that moves between the two complete passes never produces a
+// receipt: bytes built from one pass's paths and another pass's content would
+// name a state the worktree never held. The change is driven from the window
+// between the passes rather than from a competing goroutine, so it lands
+// exactly once, every time, with no sleeping.
+func TestVerifyBoundedReviewRefusesAWorktreeThatMovesBetweenPasses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// want is every fragment the refusal must name.
+		want []string
+		// change is what the worktree does after the first complete pass.
+		change func(t *testing.T, repo string)
+		// after proves the refusal left that change on disk as evidence.
+		after func(t *testing.T, repo string)
+	}{
+		{
+			// The second pass reproves the declared scope from scratch, so a file
+			// that appeared after the first one is refused as the out-of-scope
+			// change it is rather than admitted because an earlier pass was clean.
+			name: "a path outside the scope appears after the first pass",
+			want: []string{"outside the declared write scope", "notes.md"},
+			change: func(t *testing.T, repo string) {
+				writeBoundedFile(t, filepath.Join(repo, "notes.md"), "added\n")
+			},
+			after: func(t *testing.T, repo string) {
+				assertBoundedContent(t, filepath.Join(repo, "notes.md"), "added\n")
+			},
+		},
+		{
+			// Both passes name the same in-scope path, so nothing but the second
+			// fingerprint can see that the content underneath it moved.
+			name: "a path inside the scope is rewritten after the first pass",
+			want: []string{"repository changed during boundary observation"},
+			change: func(t *testing.T, repo string) {
+				writeBoundedFile(t, filepath.Join(repo, "reports", "summary.md"), "second\n")
+			},
+			after: func(t *testing.T, repo string) {
+				assertBoundedContent(t, filepath.Join(repo, "reports", "summary.md"), "second\n")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBoundedFixture(t, []string{"reports/"}).stage(t)
+			writeBoundedFile(t, filepath.Join(f.repo, "reports", "summary.md"), "first\n")
+
+			windows := 0
+			boundedBetweenPassesRace = func() {
+				windows++
+				tc.change(t, f.repo)
+			}
+			t.Cleanup(func() { boundedBetweenPassesRace = nil })
+
+			payload, err := f.engine.verifyBoundedReview(context.Background(), f.run, f.job)
+			if windows != 1 {
+				t.Fatalf("the window between the passes was entered %d times, want exactly 1", windows)
+			}
+			for _, want := range tc.want {
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("err=%v want it to contain %q", err, want)
+				}
+			}
+			if payload != "" {
+				t.Fatalf("refused observation returned receipt %q", payload)
+			}
+			if _, stored := boundedStoredReceipts(t, f.store, f.run.ID); stored != "" {
+				t.Fatalf("refused observation persisted change receipt %q", stored)
+			}
+			// A refusal is not a cleanup: the staged snapshot is still byte for
+			// byte what it was staged from, and whatever moved is still on disk.
+			assertBoundedSameBytes(t, f.staged(), f.source)
+			tc.after(t, f.repo)
+		})
+	}
+}
+
 func TestBoundedReviewIsInertWhenNeitherFieldIsDeclared(t *testing.T) {
 	// The worktree path does not exist and is not a repository, so any staging,
 	// git enumeration, or receipt write would fail instead of returning cleanly.
