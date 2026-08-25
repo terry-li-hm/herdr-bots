@@ -84,23 +84,41 @@ func captureShowStdout(t *testing.T, fn func() error) (string, error) {
 }
 
 // assertReceiptLinesFollowVerdict proves the three receipt lines are emitted
-// exactly, in order, on the three lines immediately after the verdict line.
+// exactly, in order, as a contiguous block starting at the model-attestation
+// line, and that the verdict, lane, and reason lines precede that block.
 func assertReceiptLinesFollowVerdict(t *testing.T, output string, want []string) {
 	t.Helper()
 	lines := strings.Split(output, "\n")
+	start := -1
 	for i, line := range lines {
-		if !strings.HasPrefix(line, "verdict: ") {
-			continue
+		if strings.HasPrefix(line, "model-attestation: ") {
+			start = i
+			break
 		}
-		if len(lines) < i+1+len(want) {
-			t.Fatalf("show output ended before the receipt lines: %q", output)
-		}
-		if got := lines[i+1 : i+1+len(want)]; !reflect.DeepEqual(got, want) {
-			t.Fatalf("receipt lines = %q, want %q", got, want)
-		}
-		return
 	}
-	t.Fatalf("show output has no verdict line: %q", output)
+	if start < 0 {
+		t.Fatalf("show output has no model-attestation line: %q", output)
+	}
+	if len(lines) < start+len(want) {
+		t.Fatalf("show output ended before the receipt lines: %q", output)
+	}
+	if got := lines[start : start+len(want)]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("receipt lines = %q, want %q", got, want)
+	}
+	// The receipts are the tail of the report: the verdict and its lane and
+	// reason must already have been printed by the time they appear.
+	for _, prefix := range []string{"verdict: ", "lane: ", "reason: "} {
+		found := false
+		for _, line := range lines[:start] {
+			if strings.HasPrefix(line, prefix) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("show output has no %q line before the receipts: %q", prefix, output)
+		}
+	}
 }
 
 func TestShowReportsPersistedReceiptsVerbatimAndMarksRead(t *testing.T) {
