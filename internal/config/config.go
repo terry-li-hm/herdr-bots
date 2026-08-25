@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -51,6 +52,10 @@ const (
 
 	PermissionReadOnly  = "read-only-no-network"
 	PermissionRepoWrite = "repo-write-no-network"
+
+	AcceptanceMandatory = "mandatory"
+	AcceptanceAuto      = "auto"
+	AcceptanceSample    = "sample"
 )
 
 type Config struct {
@@ -65,18 +70,19 @@ type Capacity struct {
 }
 
 type Job struct {
-	ID             string     `yaml:"id" json:"id"`
-	Revision       int        `yaml:"revision" json:"revision"`
-	Enabled        *bool      `yaml:"enabled,omitempty" json:"enabled"`
-	Schedule       Schedule   `yaml:"schedule" json:"schedule"`
-	Execution      Execution  `yaml:"execution" json:"execution"`
-	RunIfChanged   bool       `yaml:"run_if_changed,omitempty" json:"run_if_changed"`
-	Prompt         string     `yaml:"prompt" json:"prompt"`
-	TimeoutMinutes int        `yaml:"timeout_minutes,omitempty" json:"timeout_minutes"`
-	Overlap        string     `yaml:"overlap,omitempty" json:"overlap"`
-	Verifier       *Verifier  `yaml:"verifier,omitempty" json:"verifier,omitempty"`
-	Limits         Limits     `yaml:"limits,omitempty" json:"limits"`
-	Attention      *Attention `yaml:"attention,omitempty" json:"attention,omitempty"`
+	ID             string      `yaml:"id" json:"id"`
+	Revision       int         `yaml:"revision" json:"revision"`
+	Enabled        *bool       `yaml:"enabled,omitempty" json:"enabled"`
+	Schedule       Schedule    `yaml:"schedule" json:"schedule"`
+	Execution      Execution   `yaml:"execution" json:"execution"`
+	RunIfChanged   bool        `yaml:"run_if_changed,omitempty" json:"run_if_changed"`
+	Prompt         string      `yaml:"prompt" json:"prompt"`
+	TimeoutMinutes int         `yaml:"timeout_minutes,omitempty" json:"timeout_minutes"`
+	Overlap        string      `yaml:"overlap,omitempty" json:"overlap"`
+	Verifier       *Verifier   `yaml:"verifier,omitempty" json:"verifier,omitempty"`
+	Acceptance     *Acceptance `yaml:"acceptance,omitempty" json:"acceptance,omitempty"`
+	Limits         Limits      `yaml:"limits,omitempty" json:"limits"`
+	Attention      *Attention  `yaml:"attention,omitempty" json:"attention,omitempty"`
 }
 
 // Attention holds opt-in operator-attention gates. An absent attention block
@@ -109,6 +115,11 @@ type Execution struct {
 
 type Verifier struct {
 	Command []string `yaml:"command" json:"command"`
+}
+
+type Acceptance struct {
+	Mode          string `yaml:"mode" json:"mode"`
+	SamplePercent int    `yaml:"sample_percent,omitempty" json:"sample_percent,omitempty"`
 }
 
 type Limits struct {
@@ -305,6 +316,30 @@ func (j Job) validate() error {
 			}
 		}
 	}
+	if j.Acceptance != nil {
+		switch j.Acceptance.Mode {
+		case AcceptanceMandatory:
+			if j.Acceptance.SamplePercent != 0 {
+				return fmt.Errorf("%s: acceptance.sample_percent is allowed only for sample mode", j.ID)
+			}
+		case AcceptanceAuto:
+			if j.Acceptance.SamplePercent != 0 {
+				return fmt.Errorf("%s: acceptance.sample_percent is allowed only for sample mode", j.ID)
+			}
+			if j.Verifier == nil {
+				return fmt.Errorf("%s: acceptance auto mode requires a verifier", j.ID)
+			}
+		case AcceptanceSample:
+			if j.Verifier == nil {
+				return fmt.Errorf("%s: acceptance sample mode requires a verifier", j.ID)
+			}
+			if j.Acceptance.SamplePercent < 1 || j.Acceptance.SamplePercent > 100 {
+				return fmt.Errorf("%s: acceptance.sample_percent must be between 1 and 100", j.ID)
+			}
+		default:
+			return fmt.Errorf("%s: acceptance.mode must be mandatory, auto, or sample", j.ID)
+		}
+	}
 	return nil
 }
 
@@ -325,6 +360,84 @@ func (j Job) MaxUnreadTerminalRuns() int {
 		return 0
 	}
 	return *j.Attention.MaxUnreadTerminalRuns
+}
+
+func (j Job) AcceptanceMode() string {
+	if j.Acceptance == nil || j.Acceptance.Mode == "" {
+		return AcceptanceMandatory
+	}
+	return j.Acceptance.Mode
+}
+
+func (j Job) ClassifyTerminalRun(runID, state, verdict string) (string, string, bool) {
+	normalizedVerdict := strings.TrimSpace(verdict)
+	if normalizedVerdict == "" {
+		normalizedVerdict = "unverified"
+	}
+	if normalizedVerdict == "failed" {
+		return AcceptanceMandatory, "verifier_failed", true
+	}
+	if state != "succeeded" {
+		if strings.TrimSpace(state) == "" {
+			return AcceptanceMandatory, "state_unknown", true
+		}
+		return AcceptanceMandatory, "state_" + state, true
+	}
+	if normalizedVerdict != "passed" {
+		return AcceptanceMandatory, "unverified", true
+	}
+	switch j.AcceptanceMode() {
+	case AcceptanceAuto:
+		if j.Acceptance != nil && j.Acceptance.SamplePercent != 0 {
+			return AcceptanceMandatory, "acceptance_invalid", true
+		}
+		if !j.hasDeterministicVerifier() {
+			return AcceptanceMandatory, "verifier_missing", true
+		}
+		return AcceptanceAuto, "verifier_passed", false
+	case AcceptanceSample:
+		if j.Acceptance == nil || j.Acceptance.SamplePercent < 1 || j.Acceptance.SamplePercent > 100 {
+			return AcceptanceMandatory, "acceptance_invalid", true
+		}
+		if !j.hasDeterministicVerifier() {
+			return AcceptanceMandatory, "verifier_missing", true
+		}
+		if acceptanceSampled(runID, j.Acceptance.SamplePercent) {
+			return AcceptanceSample, "sampled", true
+		}
+		return AcceptanceAuto, "unsampled", false
+	case AcceptanceMandatory:
+		if j.Acceptance == nil {
+			return AcceptanceMandatory, "acceptance_missing", true
+		}
+		return AcceptanceMandatory, "mode_mandatory", true
+	default:
+		return AcceptanceMandatory, "acceptance_unknown", true
+	}
+}
+
+func (j Job) hasDeterministicVerifier() bool {
+	if j.Verifier == nil || len(j.Verifier.Command) == 0 {
+		return false
+	}
+	for _, argument := range j.Verifier.Command {
+		if argument == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func acceptanceSampled(runID string, samplePercent int) bool {
+	if samplePercent <= 0 {
+		return false
+	}
+	if samplePercent >= 100 {
+		return true
+	}
+	sum := sha256.Sum256([]byte(runID))
+	bucket := binary.BigEndian.Uint64(sum[:8]) % 100
+	return int(bucket) < samplePercent
 }
 
 func (c *Capacity) applyDefaults() {

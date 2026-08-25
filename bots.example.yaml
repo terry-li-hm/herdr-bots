@@ -43,6 +43,11 @@ jobs:
     overlap: forbid
     verifier:
       command: ["git", "diff", "--check"]
+    # Optional review lane. Omit this block to keep snapshots byte-stable and
+    # route terminal runs to mandatory review by default.
+    # acceptance:
+    #   mode: sample               # mandatory | auto | sample
+    #   sample_percent: 10         # required only for sample; 1..100
     limits:
       max_runs_per_day: 1
       disk_reserve_gib: 1.25
@@ -74,6 +79,9 @@ jobs:
     #   max_unread_terminal_runs: 1
     verifier:
       command: ["git", "diff", "--check"]
+    # Auto and sample acceptance require a verifier.
+    # acceptance:
+    #   mode: auto
     limits:
       max_runs_per_day: 1
       disk_reserve_gib: 1.25

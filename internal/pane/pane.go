@@ -39,7 +39,7 @@ func Run(state *store.Store, client *herdr.CLI) error {
 }
 
 func load(state *store.Store, client *herdr.CLI) model {
-	runs, err := state.ListRuns(context.Background(), "", 100)
+	runs, err := state.ListRunsGroupedByAcceptance(context.Background(), "", 100)
 	return model{state: state, herdr: client, runs: runs, err: err}
 }
 
@@ -112,7 +112,7 @@ func (m model) View() string {
 		if run.Unread {
 			mark = "*"
 		}
-		plain := fmt.Sprintf("%s %-22s %-13s %-10s %s", mark, truncate(run.JobID, 22), truncate(run.State, 13), truncate(run.TaskVerdict, 10), run.UpdatedAt.Local().Format("02 Jan 15:04"))
+		plain := fmt.Sprintf("%s %-16s %-10s %-11s %-18s %-12s %s", mark, truncate(run.JobID, 16), truncate(run.TaskVerdict, 10), truncate(acceptanceField(run.AcceptanceLane), 11), truncate(acceptanceField(run.AcceptanceReason), 18), truncate(run.State, 12), run.UpdatedAt.Local().Format("02 Jan 15:04"))
 		if i == m.cursor {
 			out += selectedStyle.Render(" "+plain+" ") + "\n"
 			continue
@@ -142,4 +142,11 @@ func truncate(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit-1]) + "…"
+}
+
+func acceptanceField(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }

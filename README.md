@@ -144,6 +144,9 @@ jobs:
     overlap: forbid
     verifier:
       command: ["git", "diff", "--check"]
+    acceptance:
+      mode: sample
+      sample_percent: 10
     limits:
       max_runs_per_day: 1
       disk_reserve_gib: 1.25
@@ -155,6 +158,13 @@ monotonic saved-authority generation: increase it whenever any job field
 changes. A lower revision is rejected, and reusing one revision for a
 different snapshot hash fails closed rather than overwriting current
 authority.
+
+`acceptance` is optional. When the block is absent, snapshots stay byte-stable
+and terminal review defaults to `mandatory` without changing the saved
+revision. `mode` accepts `mandatory`, `auto`, or `sample`. `auto` and
+`sample` require a verifier. `sample_percent` is valid only for `sample` and
+must be 1 through 100. Sampling is deterministic from a SHA-256 bucket of the
+immutable run ID, so concurrent processes classify the same run the same way.
 
 The default state database is `~/.local/state/herdr-bots/state.sqlite3`.
 
@@ -175,11 +185,16 @@ herdr-bots service render
 ```
 
 `list` reports the latest run state or a schedule outcome such as
-`skipped_unchanged`. `show` marks a run read; asterisks in `runs` and `pane`
-mark unread results. The attended `run` command waits on durable state rather
-than process-local executor presence. The Herdr pane is read-oriented: Enter
+`skipped_unchanged`. `runs` and `pane` group terminal review as `mandatory`,
+then `sample`, then `auto`, and keep active runs visible after that group even
+when a terminal-history limit applies. They show the verifier verdict, review
+lane, and machine reason. `show` prints the same lane and reason and marks the
+run read. Auto-reviewed terminal runs start read; sampled and mandatory
+terminal runs start unread. Asterisks in `runs` and `pane` mark unread
+results. The attended `run` command waits on durable state rather than
+process-local executor presence. The Herdr pane is read-oriented: Enter
 focuses the exact run workspace and marks it read; it does not mutate
-schedules or clean worktrees.
+schedules or clean worktrees. Classification grants no further authority.
 
 Event jobs (`schedule.kind: event`) have no clock occurrence. Only the local
 typed command accepts one:

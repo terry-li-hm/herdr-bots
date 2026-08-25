@@ -63,6 +63,13 @@ func TestLoadValidConfigAndSnapshot(t *testing.T) {
 	if err != nil || len(raw) == 0 || len(revision) != 64 {
 		t.Fatalf("bad snapshot: bytes=%d revision=%q err=%v", len(raw), revision, err)
 	}
+	if strings.Contains(string(raw), "acceptance") {
+		t.Fatalf("absent acceptance changed snapshot: %s", raw)
+	}
+	const wantSnapshotHash = "e31805f4de0c73accacf3e25d7e26f0d403ac9e80ee6fb6bc2cae991feb8005e"
+	if revision != wantSnapshotHash {
+		t.Fatalf("absent acceptance changed snapshot hash: got %s want %s", revision, wantSnapshotHash)
+	}
 }
 
 func TestLoadRejectsUnknownFields(t *testing.T) {
@@ -349,5 +356,115 @@ func TestAttentionUnreadGuardIsOptionalAndValidated(t *testing.T) {
 	body := strings.Replace(withLimit, "max_unread_terminal_runs: 1", "max_unread_terminal_runs: 1\n      surprise: true", 1)
 	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "surprise") {
 		t.Fatalf("expected unknown attention field error, got %v", err)
+	}
+}
+
+func TestAcceptanceValidationAndSampling(t *testing.T) {
+	withVerifier := strings.Replace(validYAML(), "    overlap: forbid\n    limits:\n", "    overlap: forbid\n    verifier:\n      command: [\"git\", \"diff\", \"--check\"]\n    limits:\n", 1)
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "auto requires verifier",
+			body: strings.Replace(validYAML(), "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: auto\n", 1),
+			want: "auto mode requires a verifier",
+		},
+		{
+			name: "sample requires verifier",
+			body: strings.Replace(validYAML(), "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: sample\n      sample_percent: 10\n", 1),
+			want: "sample mode requires a verifier",
+		},
+		{
+			name: "sample lower bound",
+			body: strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: sample\n      sample_percent: 0\n", 1),
+			want: "acceptance.sample_percent must be between 1 and 100",
+		},
+		{
+			name: "sample upper bound",
+			body: strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: sample\n      sample_percent: 101\n", 1),
+			want: "acceptance.sample_percent must be between 1 and 100",
+		},
+		{
+			name: "sample percent only on auto",
+			body: strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: auto\n      sample_percent: 10\n", 1),
+			want: "acceptance.sample_percent is allowed only for sample mode",
+		},
+		{
+			name: "sample percent only on mandatory",
+			body: strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: mandatory\n      sample_percent: 10\n", 1),
+			want: "acceptance.sample_percent is allowed only for sample mode",
+		},
+		{
+			name: "unknown mode",
+			body: strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: later\n", 1),
+			want: "acceptance.mode must be mandatory, auto, or sample",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, tc.body)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want substring %q", err, tc.want)
+			}
+		})
+	}
+	cfg, err := Load(writeConfig(t, strings.Replace(withVerifier, "    overlap: forbid\n", "    overlap: forbid\n    acceptance:\n      mode: sample\n      sample_percent: 100\n", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Jobs[0].AcceptanceMode() != AcceptanceSample {
+		t.Fatalf("acceptance=%+v", cfg.Jobs[0].Acceptance)
+	}
+}
+
+func TestClassifyTerminalRunDeterministicAndFailClosed(t *testing.T) {
+	verifying := Job{ID: "job", Verifier: &Verifier{Command: []string{"git", "diff", "--check"}}}
+	sampleJob := Job{ID: "job", Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceSample, SamplePercent: 50}}
+	foundSample := false
+	foundUnsampled := false
+	for i := 0; i < 2000 && (!foundSample || !foundUnsampled); i++ {
+		runID := fmt.Sprintf("run-%d", i)
+		lane, reason, unread := sampleJob.ClassifyTerminalRun(runID, "succeeded", "passed")
+		againLane, againReason, againUnread := sampleJob.ClassifyTerminalRun(runID, "succeeded", "passed")
+		if lane != againLane || reason != againReason || unread != againUnread {
+			t.Fatalf("classification changed for %s", runID)
+		}
+		if lane == AcceptanceSample {
+			foundSample = true
+		}
+		if lane == AcceptanceAuto {
+			foundUnsampled = true
+		}
+	}
+	if !foundSample || !foundUnsampled {
+		t.Fatalf("sampling never produced both lanes: sample=%t unsampled=%t", foundSample, foundUnsampled)
+	}
+	for _, tc := range []struct {
+		name       string
+		job        Job
+		state      string
+		verdict    string
+		wantLane   string
+		wantReason string
+		wantUnread bool
+	}{
+		{name: "missing acceptance defaults mandatory", job: verifying, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "acceptance_missing", wantUnread: true},
+		{name: "explicit mandatory", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceMandatory}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "mode_mandatory", wantUnread: true},
+		{name: "auto passes through", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceAuto, wantReason: "verifier_passed", wantUnread: false},
+		{name: "malformed auto without verifier", job: Job{Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "verifier_missing", wantUnread: true},
+		{name: "malformed sample without verifier", job: Job{Acceptance: &Acceptance{Mode: AcceptanceSample, SamplePercent: 100}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "verifier_missing", wantUnread: true},
+		{name: "malformed auto sample percent", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceAuto, SamplePercent: 10}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "acceptance_invalid", wantUnread: true},
+		{name: "malformed sample percent", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceSample, SamplePercent: 101}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "acceptance_invalid", wantUnread: true},
+		{name: "malformed verifier command", job: Job{Verifier: &Verifier{Command: []string{""}}, Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "succeeded", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "verifier_missing", wantUnread: true},
+		{name: "failed verifier overrides", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "succeeded", verdict: "failed", wantLane: AcceptanceMandatory, wantReason: "verifier_failed", wantUnread: true},
+		{name: "blank verdict is unverified", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "succeeded", verdict: "", wantLane: AcceptanceMandatory, wantReason: "unverified", wantUnread: true},
+		{name: "unknown state is mandatory", job: Job{Verifier: verifying.Verifier, Acceptance: &Acceptance{Mode: AcceptanceAuto}}, state: "", verdict: "passed", wantLane: AcceptanceMandatory, wantReason: "state_unknown", wantUnread: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lane, reason, unread := tc.job.ClassifyTerminalRun("run-id", tc.state, tc.verdict)
+			if lane != tc.wantLane || reason != tc.wantReason || unread != tc.wantUnread {
+				t.Fatalf("lane=%s reason=%s unread=%t", lane, reason, unread)
+			}
+		})
 	}
 }

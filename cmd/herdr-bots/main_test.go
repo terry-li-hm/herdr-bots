@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/terry-li-hm/herdr-bots/internal/config"
 	"github.com/terry-li-hm/herdr-bots/internal/store"
 )
 
@@ -254,7 +255,7 @@ func TestAttendedWaitDoesNotCallForeignOwnedRunStalled(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if err := state.Transition(ctx, run.ID, store.StateSettled, store.StateSucceeded, "foreign process", time.Now()); err != nil {
+		if err := state.Finish(ctx, run.ID, store.StateSettled, store.StateSucceeded, "completed", "completed", "unverified", "", "foreign process", time.Now()); err != nil {
 			t.Error(err)
 		}
 	}()
@@ -348,5 +349,170 @@ func TestListReportsPauseReasonWithoutMarkingRead(t *testing.T) {
 	runs, err = state.ListRuns(context.Background(), "repair", 10)
 	if err != nil || len(runs) != 1 || !runs[0].Unread {
 		t.Fatalf("list must not mark runs read: runs=%+v err=%v", runs, err)
+	}
+}
+
+func captureRunStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	original := os.Stdout
+	read, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured []byte
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := read.Read(buf)
+			captured = append(captured, buf[:n]...)
+			if readErr != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	os.Stdout = writeEnd
+	runErr := fn()
+	os.Stdout = original
+	_ = writeEnd.Close()
+	<-done
+	_ = read.Close()
+	return string(captured), runErr
+}
+
+func TestRunsAndShowDisplayAcceptanceGroupingAndLegacyFields(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.db")
+	state, err := store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+	if _, err := state.SyncJob(context.Background(), "job", "rev1", []byte(`{"id":"job"}`), true, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	createRun := func(job config.Job, at time.Time, finish bool) store.Run {
+		raw, _, err := job.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := state.CreateManualRun(context.Background(), "job", "rev1", raw, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if finish {
+			if err := state.Finish(context.Background(), run.ID, store.StateAccepted, store.StateSucceeded, "completed", "completed", "passed", "", run.ID, at.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got, err := state.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	mandatory := createRun(config.Job{ID: "job"}, now, true)
+	sample := createRun(config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceSample, SamplePercent: 100}}, now.Add(time.Minute), true)
+	auto := createRun(config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}, now.Add(2*time.Minute), true)
+	active := createRun(config.Job{ID: "job"}, now.Add(3*time.Minute), false)
+	if err := state.Transition(context.Background(), active.ID, store.StateAccepted, store.StateProvisioning, "provisioning", now.Add(3*time.Minute+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runsOutput, err := captureRunStdout(t, func() error {
+		return run([]string{"runs", "--state", statePath})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	indices := []int{strings.Index(runsOutput, mandatory.ID), strings.Index(runsOutput, sample.ID), strings.Index(runsOutput, auto.ID), strings.Index(runsOutput, active.ID)}
+	for _, idx := range indices {
+		if idx == -1 {
+			t.Fatalf("missing run in output:\n%s", runsOutput)
+		}
+	}
+	if !(indices[0] < indices[1] && indices[1] < indices[2] && indices[2] < indices[3]) {
+		t.Fatalf("unexpected grouping order:\n%s", runsOutput)
+	}
+	for _, want := range []string{"VERDICT", "LANE", "REASON", "STATE", "unverified", store.StateProvisioning} {
+		if !strings.Contains(runsOutput, want) {
+			t.Fatalf("runs output missing %q:\n%s", want, runsOutput)
+		}
+	}
+	showOutput, err := captureRunStdout(t, func() error {
+		return run([]string{"show", active.ID, "--state", statePath})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"lane: -", "reason: -", "state: provisioning"} {
+		if !strings.Contains(showOutput, want) {
+			t.Fatalf("show output missing %q:\n%s", want, showOutput)
+		}
+	}
+}
+
+func TestAutoAcceptanceDoesNotTripUnreadGuard(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "events.yaml")
+	statePath := filepath.Join(dir, "state.db")
+	body := `version: 1
+jobs:
+  - id: repair
+    enabled: true
+    schedule:
+      kind: event
+      timezone: Asia/Hong_Kong
+    execution:
+      repository: ` + dir + `
+      workspace: worktree
+      harness: pi
+      provider: openai-codex
+      model: gpt-5.6-sol
+      thinking: high
+      permission_profile: read-only-no-network
+    prompt: Use only saved authority.
+    overlap: forbid
+    attention:
+      max_unread_terminal_runs: 1
+    verifier:
+      command: ["git", "diff", "--check"]
+    acceptance:
+      mode: auto
+    limits:
+      max_runs_per_day: 10
+`
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"enqueue", "repair", "--event-id", "guard-1", "--config", configPath, "--state", statePath}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := state.ListRuns(context.Background(), "repair", 10)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("runs=%+v err=%v", runs, err)
+	}
+	if err := state.Finish(context.Background(), runs[0].ID, store.StateAccepted, store.StateSucceeded, "completed", "completed", "passed", "", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	doneRun, err := state.GetRun(context.Background(), runs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doneRun.Unread {
+		t.Fatalf("auto lane should terminalize as read: %+v", doneRun)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"enqueue", "repair", "--event-id", "guard-2", "--config", configPath, "--state", statePath}); err != nil {
+		t.Fatalf("auto-reviewed terminal run should not pause future admission: %v", err)
 	}
 }

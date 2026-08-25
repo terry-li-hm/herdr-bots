@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/terry-li-hm/herdr-bots/internal/config"
 )
 
 func testStore(t *testing.T) *Store {
@@ -42,6 +45,35 @@ func syncJob(t *testing.T, s *Store, now time.Time) JobState {
 
 func request(at time.Time) AcceptRequest {
 	return AcceptRequest{JobID: "job", JobRevision: "rev1", OccurrenceKey: "cron:" + at.Format("2006-01-02T15:04"), Definition: []byte(`{"id":"job"}`), Trigger: "cron", ScheduledFor: at, Overlap: "forbid", DayStart: at.Add(-time.Hour), MaxRunsPerDay: 10, Now: at.Add(30 * time.Second)}
+}
+
+func snapshotDefinition(t *testing.T, job config.Job) []byte {
+	t.Helper()
+	raw, _, err := job.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func insertAcceptedRun(t *testing.T, s *Store, id string, definition []byte, now time.Time) {
+	t.Helper()
+	if _, err := s.db.Exec(`INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,accepted_at,accepted_unix_nano,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, id, "job", "rev1", definition, "manual", StateAccepted, formatTime(now), now.UnixNano(), formatTime(now)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func findAcceptanceRunID(t *testing.T, job config.Job, wantLane string) string {
+	t.Helper()
+	for i := 0; i < 5000; i++ {
+		candidate := fmt.Sprintf("acceptance-%d", i)
+		lane, _, _ := job.ClassifyTerminalRun(candidate, StateSucceeded, "passed")
+		if lane == wantLane {
+			return candidate
+		}
+	}
+	t.Fatalf("no run id found for lane %s", wantLane)
+	return ""
 }
 
 func TestOccurrenceIsAcceptedOnce(t *testing.T) {
@@ -284,11 +316,165 @@ func TestTerminalStateCannotTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Transition(context.Background(), accepted.Run.ID, StateAccepted, StateSucceeded, "bad", at); err == nil {
+		t.Fatal("terminal destination should require Finish")
+	}
 	if err := s.Finish(context.Background(), accepted.Run.ID, StateAccepted, StateFailed, "failed", "not_started", "unverified", "test", "boom", at); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Transition(context.Background(), accepted.Run.ID, StateFailed, StateRunning, "bad", at); err == nil {
 		t.Fatal("terminal transition should fail")
+	}
+}
+
+func TestFinishRejectsTerminalSourceAndPreservesClassification(t *testing.T) {
+	s := testStore(t)
+	now := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, now.Add(-time.Hour))
+	job := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	insertAcceptedRun(t, s, "immutable-terminal", snapshotDefinition(t, job), now)
+	if err := s.Finish(context.Background(), "immutable-terminal", StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "first", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	original, err := s.GetRun(context.Background(), "immutable-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(context.Background(), "immutable-terminal", StateSucceeded, StateFailed, "failed", "failed", "failed", "mutated", "second", now.Add(2*time.Second)); err == nil {
+		t.Fatal("duplicate finish should be rejected")
+	}
+	after, err := s.GetRun(context.Background(), "immutable-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != original.State || after.InfrastructureResult != original.InfrastructureResult || after.AgentResult != original.AgentResult || after.TaskVerdict != original.TaskVerdict || after.ErrorCode != original.ErrorCode || after.ErrorDetail != original.ErrorDetail || after.AcceptanceLane != original.AcceptanceLane || after.AcceptanceReason != original.AcceptanceReason || after.Unread != original.Unread {
+		t.Fatalf("terminal run changed: before=%+v after=%+v", original, after)
+	}
+}
+
+func TestFinishPersistsAcceptanceLaneReasonAndUnread(t *testing.T) {
+	s := testStore(t)
+	now := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, now.Add(-time.Hour))
+	autoJob := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	sampleJob := config.Job{ID: "job", Verifier: autoJob.Verifier, Acceptance: &config.Acceptance{Mode: config.AcceptanceSample, SamplePercent: 50}}
+	cases := []struct {
+		name       string
+		id         string
+		job        config.Job
+		state      string
+		verdict    string
+		wantLane   string
+		wantReason string
+		wantUnread bool
+	}{
+		{name: "default mandatory", id: "mandatory-default", job: config.Job{ID: "job"}, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceMandatory, wantReason: "acceptance_missing", wantUnread: true},
+		{name: "configured mandatory", id: "mandatory-explicit", job: config.Job{ID: "job", Acceptance: &config.Acceptance{Mode: config.AcceptanceMandatory}}, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceMandatory, wantReason: "mode_mandatory", wantUnread: true},
+		{name: "auto passed", id: "auto-pass", job: autoJob, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceAuto, wantReason: "verifier_passed", wantUnread: false},
+		{name: "malformed auto without verifier", id: "auto-no-verifier", job: config.Job{ID: "job", Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceMandatory, wantReason: "verifier_missing", wantUnread: true},
+		{name: "sampled", id: findAcceptanceRunID(t, sampleJob, config.AcceptanceSample), job: sampleJob, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceSample, wantReason: "sampled", wantUnread: true},
+		{name: "unsampled", id: findAcceptanceRunID(t, sampleJob, config.AcceptanceAuto), job: sampleJob, state: StateSucceeded, verdict: "passed", wantLane: config.AcceptanceAuto, wantReason: "unsampled", wantUnread: false},
+		{name: "verifier failed", id: "verifier-failed", job: autoJob, state: StateSucceeded, verdict: "failed", wantLane: config.AcceptanceMandatory, wantReason: "verifier_failed", wantUnread: true},
+		{name: "succeeded unverified", id: "succeeded-unverified", job: autoJob, state: StateSucceeded, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "unverified", wantUnread: true},
+		{name: "unknown verdict", id: "unknown-verdict", job: autoJob, state: StateSucceeded, verdict: "unknown", wantLane: config.AcceptanceMandatory, wantReason: "unverified", wantUnread: true},
+		{name: "failed state", id: "state-failed", job: autoJob, state: StateFailed, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "state_failed", wantUnread: true},
+		{name: "blocked state", id: "state-blocked", job: autoJob, state: StateBlocked, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "state_blocked", wantUnread: true},
+		{name: "timed out state", id: "state-timeout", job: autoJob, state: StateTimedOut, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "state_timed_out", wantUnread: true},
+		{name: "interrupted state", id: "state-interrupted", job: autoJob, state: StateInterrupted, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "state_interrupted", wantUnread: true},
+		{name: "cancelled state", id: "state-cancelled", job: autoJob, state: StateCancelled, verdict: "unverified", wantLane: config.AcceptanceMandatory, wantReason: "state_cancelled", wantUnread: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			insertAcceptedRun(t, s, tc.id, snapshotDefinition(t, tc.job), now)
+			if err := s.Finish(context.Background(), tc.id, StateAccepted, tc.state, "completed", "completed", tc.verdict, "", tc.name, now.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.GetRun(context.Background(), tc.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.AcceptanceLane != tc.wantLane || got.AcceptanceReason != tc.wantReason || got.Unread != tc.wantUnread {
+				t.Fatalf("run=%+v", got)
+			}
+		})
+	}
+	insertAcceptedRun(t, s, "malformed-snapshot", []byte(`{"acceptance":`), now)
+	if err := s.Finish(context.Background(), "malformed-snapshot", StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "malformed", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	malformed, err := s.GetRun(context.Background(), "malformed-snapshot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if malformed.AcceptanceLane != config.AcceptanceMandatory || malformed.AcceptanceReason != "snapshot_invalid" || !malformed.Unread {
+		t.Fatalf("malformed snapshot did not fail closed: %+v", malformed)
+	}
+}
+
+func TestListRunsGroupedByAcceptanceOrdersMandatorySampleAutoThenActive(t *testing.T) {
+	s := testStore(t)
+	now := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, now.Add(-time.Hour))
+	autoJob := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	sampleJob := config.Job{ID: "job", Verifier: autoJob.Verifier, Acceptance: &config.Acceptance{Mode: config.AcceptanceSample, SamplePercent: 50}}
+	mandatoryID := "group-mandatory"
+	sampleID := findAcceptanceRunID(t, sampleJob, config.AcceptanceSample)
+	autoID := "group-auto"
+	activeID := "group-active"
+	insertAcceptedRun(t, s, mandatoryID, snapshotDefinition(t, config.Job{ID: "job"}), now)
+	insertAcceptedRun(t, s, sampleID, snapshotDefinition(t, sampleJob), now.Add(time.Minute))
+	insertAcceptedRun(t, s, autoID, snapshotDefinition(t, autoJob), now.Add(2*time.Minute))
+	insertAcceptedRun(t, s, activeID, snapshotDefinition(t, autoJob), now.Add(3*time.Minute))
+	if _, err := s.SyncJob(context.Background(), "other", "rev1", []byte(`{"id":"other"}`), true, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,accepted_at,accepted_unix_nano,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, "other-active", "other", "rev1", []byte(`{"id":"other"}`), "manual", StateAccepted, formatTime(now), now.UnixNano(), formatTime(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(context.Background(), mandatoryID, StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "mandatory", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(context.Background(), sampleID, StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "sample", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(context.Background(), autoID, StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "auto", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{mandatoryID, sampleID, autoID, activeID}
+	if len(runs) != len(want) {
+		t.Fatalf("runs=%+v", runs)
+	}
+	for i, id := range want {
+		if runs[i].ID != id {
+			t.Fatalf("got order=%+v want=%v", runs, want)
+		}
+	}
+}
+
+func TestListRunsGroupedByAcceptanceKeepsActiveRunsVisibleUnderLimit(t *testing.T) {
+	s := testStore(t)
+	now := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, now.Add(-time.Hour))
+	autoJob := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("terminal-%d", i)
+		insertAcceptedRun(t, s, id, snapshotDefinition(t, autoJob), now.Add(time.Duration(i)*time.Minute))
+		if err := s.Finish(context.Background(), id, StateAccepted, StateSucceeded, "completed", "completed", "passed", "", id, now.Add(time.Duration(i)*time.Minute).Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activeID := "still-active"
+	insertAcceptedRun(t, s, activeID, snapshotDefinition(t, autoJob), now.Add(10*time.Minute))
+	runs, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 2 || runs[0].State != StateSucceeded || runs[1].ID != activeID || runs[1].State != StateAccepted {
+		t.Fatalf("runs=%+v", runs)
 	}
 }
 
@@ -640,8 +826,8 @@ VALUES('job','rev7','{"id":"job","revision":7}',1,'2026-08-22T00:00:00Z','2026-0
 INSERT INTO occurrences(job_id,scheduled_for,outcome,created_at) VALUES
 ('job','2026-08-22T00:00:00Z','missed','2026-08-22T00:00:00.5Z'),
 ('job','2026-08-22T01:00:00Z','missed','2026-08-22T00:00:00Z');
-INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,accepted_at,updated_at)
-VALUES('legacy-run','job','rev7','{"id":"job","revision":7}','manual','accepted','2026-08-22T00:00:00.5Z','2026-08-22T00:00:00.5Z');
+INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,task_verdict,accepted_at,updated_at)
+VALUES('legacy-run','job','rev7','{"id":"job","revision":7}','manual','succeeded','passed','2026-08-22T00:00:00.5Z','2026-08-22T00:00:00.5Z');
 `)
 	if closeErr := db.Close(); err == nil {
 		err = closeErr
@@ -661,6 +847,9 @@ VALUES('legacy-run','job','rev7','{"id":"job","revision":7}','manual','accepted'
 	}
 	if legacy.DiskDevice != "" || legacy.DiskReserveGiB != 0 {
 		t.Fatalf("legacy run backfilled device=%q reserve=%v; want empty and zero", legacy.DiskDevice, legacy.DiskReserveGiB)
+	}
+	if legacy.AcceptanceLane != config.AcceptanceMandatory || legacy.AcceptanceReason != "acceptance_missing" || !legacy.Unread {
+		t.Fatalf("legacy schema without acceptance columns did not fail closed: %+v", legacy)
 	}
 	if legacy.AcceptedUnixNano != ts("2026-08-22T00:00:00.5Z").UnixNano() {
 		t.Fatalf("legacy accepted instant=%d", legacy.AcceptedUnixNano)
@@ -696,6 +885,123 @@ VALUES('defaulted-run','job','rev1','{"id":"job"}','manual','accepted','2026-08-
 	}
 	if defaulted.DiskDevice != "" || defaulted.DiskReserveGiB != 0 {
 		t.Fatalf("defaulted run device=%q reserve=%v; want empty and zero", defaulted.DiskDevice, defaulted.DiskReserveGiB)
+	}
+}
+
+func TestOpenMigratesAcceptanceClassificationAndPreservesExistingValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-acceptance.sqlite3")
+	autoJob := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	autoID := findAcceptanceRunID(t, autoJob, config.AcceptanceAuto)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+CREATE TABLE jobs (
+  id TEXT PRIMARY KEY, revision TEXT NOT NULL, definition BLOB NOT NULL,
+  enabled INTEGER NOT NULL, paused INTEGER NOT NULL DEFAULT 0,
+  completed INTEGER NOT NULL DEFAULT 0, cursor TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE occurrences (
+  job_id TEXT NOT NULL, scheduled_for TEXT NOT NULL, outcome TEXT NOT NULL,
+  run_id TEXT, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  PRIMARY KEY(job_id, scheduled_for)
+);
+CREATE TABLE runs (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, job_revision TEXT NOT NULL,
+  definition BLOB NOT NULL, trigger TEXT NOT NULL, scheduled_for TEXT,
+  state TEXT NOT NULL, infrastructure_result TEXT NOT NULL DEFAULT '',
+  agent_result TEXT NOT NULL DEFAULT '', task_verdict TEXT NOT NULL DEFAULT 'unverified',
+  accepted_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  workspace_id TEXT NOT NULL DEFAULT '', pane_id TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '', worktree_path TEXT NOT NULL DEFAULT '',
+  execution_mode TEXT NOT NULL DEFAULT 'agent', completion_marker TEXT NOT NULL DEFAULT '',
+  error_code TEXT NOT NULL DEFAULT '', error_detail TEXT NOT NULL DEFAULT '',
+  provisioning_owner TEXT NOT NULL DEFAULT '', provisioning_lease_until INTEGER NOT NULL DEFAULT 0,
+  acceptance_lane TEXT NOT NULL DEFAULT '', acceptance_reason TEXT NOT NULL DEFAULT '',
+  unread INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(job_id) REFERENCES jobs(id)
+);
+CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, from_state TEXT NOT NULL, to_state TEXT NOT NULL, at TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO jobs(id,revision,definition,enabled,cursor,updated_at)
+VALUES('job','rev1','{"id":"job"}',1,'2026-08-22T00:00:00Z','2026-08-22T00:00:00Z');
+INSERT INTO runs(id,job_id,job_revision,definition,trigger,state,infrastructure_result,agent_result,task_verdict,accepted_at,updated_at,acceptance_lane,acceptance_reason,unread)
+VALUES
+(?, 'job', 'rev1', ?, 'manual', 'succeeded', 'completed', 'completed', 'passed', '2026-08-22T01:00:00Z', '2026-08-22T01:00:00Z', '', '', 1),
+('legacy-mandatory', 'job', 'rev1', '{"id":"job"}', 'manual', 'succeeded', 'completed', 'completed', 'passed', '2026-08-22T02:00:00Z', '2026-08-22T02:00:00Z', '', '', 1),
+('legacy-kept', 'job', 'rev1', '{"id":"job"}', 'manual', 'failed', 'failed', 'not_started', 'unverified', '2026-08-22T03:00:00Z', '2026-08-22T03:00:00Z', 'kept-lane', 'kept-reason', 1),
+('legacy-partial', 'job', 'rev1', '{"id":"job"}', 'manual', 'failed', 'failed', 'not_started', 'unverified', '2026-08-22T04:00:00Z', '2026-08-22T04:00:00Z', 'partial-lane', '', 1),
+('legacy-auto-reopened', 'job', 'rev1', '{"id":"job"}', 'manual', 'failed', 'failed', 'not_started', 'unverified', '2026-08-22T04:01:00Z', '2026-08-22T04:01:00Z', 'auto', '', 1),
+('legacy-mandatory-read', 'job', 'rev1', '{"id":"job"}', 'manual', 'failed', 'failed', 'not_started', 'unverified', '2026-08-22T04:02:00Z', '2026-08-22T04:02:00Z', 'mandatory', '', 0),
+('legacy-unknown', 'job', 'rev1', '{"id":"job"}', 'manual', '', 'failed', 'not_started', 'unverified', '2026-08-22T05:00:00Z', '2026-08-22T05:00:00Z', '', '', 0);
+`, autoID, string(snapshotDefinition(t, autoJob)))
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	autoRun, err := s.GetRun(context.Background(), autoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if autoRun.AcceptanceLane != config.AcceptanceAuto || autoRun.AcceptanceReason != "verifier_passed" || autoRun.Unread {
+		t.Fatalf("auto migrated run=%+v", autoRun)
+	}
+	mandatoryRun, err := s.GetRun(context.Background(), "legacy-mandatory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mandatoryRun.AcceptanceLane != config.AcceptanceMandatory || mandatoryRun.AcceptanceReason != "acceptance_missing" || !mandatoryRun.Unread {
+		t.Fatalf("mandatory migrated run=%+v", mandatoryRun)
+	}
+	kept, err := s.GetRun(context.Background(), "legacy-kept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept.AcceptanceLane != "kept-lane" || kept.AcceptanceReason != "kept-reason" {
+		t.Fatalf("existing values changed: %+v", kept)
+	}
+	partial, err := s.GetRun(context.Background(), "legacy-partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.AcceptanceLane != "partial-lane" || partial.AcceptanceReason != "state_failed" || !partial.Unread {
+		t.Fatalf("partial migration failed closed without preserving lane or unread state: %+v", partial)
+	}
+	autoReopened, err := s.GetRun(context.Background(), "legacy-auto-reopened")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if autoReopened.AcceptanceLane != config.AcceptanceAuto || autoReopened.AcceptanceReason != "state_failed" || !autoReopened.Unread {
+		t.Fatalf("migration overwrote a later event reopen: %+v", autoReopened)
+	}
+	mandatoryRead, err := s.GetRun(context.Background(), "legacy-mandatory-read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mandatoryRead.AcceptanceLane != config.AcceptanceMandatory || mandatoryRead.AcceptanceReason != "state_failed" || mandatoryRead.Unread {
+		t.Fatalf("migration overwrote a later mark-read: %+v", mandatoryRead)
+	}
+	unknown, err := s.GetRun(context.Background(), "legacy-unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.AcceptanceLane != config.AcceptanceMandatory || unknown.AcceptanceReason != "state_unknown" || !unknown.Unread {
+		t.Fatalf("unknown migration did not fail closed: %+v", unknown)
+	}
+	grouped, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(grouped) != 2 {
+		t.Fatalf("grouped=%+v", grouped)
 	}
 }
 
@@ -1061,6 +1367,28 @@ func TestExpiredVerifierCannotBeReclaimedWithoutDurableResult(t *testing.T) {
 	}
 }
 
+func TestClaimlessLegacyVerifierRecoveryCannotBecomeAuto(t *testing.T) {
+	s := testStore(t)
+	base := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, base.Add(-time.Hour))
+	job := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	insertAcceptedRun(t, s, "legacy-verifier", snapshotDefinition(t, job), base)
+	if err := s.Transition(context.Background(), "legacy-verifier", StateAccepted, StateVerifying, "legacy verifier state", base); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := s.FinishExpiredVerifier(context.Background(), "legacy-verifier", StateSucceeded, "completed", "completed", "passed", "legacy_recovery", "legacy claimless verifier", base.Add(time.Minute))
+	if err != nil || !finished {
+		t.Fatalf("finished=%t err=%v", finished, err)
+	}
+	run, err := s.GetRun(context.Background(), "legacy-verifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AcceptanceLane != config.AcceptanceMandatory || run.AcceptanceReason != "legacy_verifier" || !run.Unread {
+		t.Fatalf("claimless legacy verifier bypassed mandatory review: %+v", run)
+	}
+}
+
 func TestVerifierCannotStealExpiredWorkspaceClose(t *testing.T) {
 	s := testStore(t)
 	base := ts("2026-08-22T01:00:00Z")
@@ -1144,6 +1472,67 @@ func TestWorkspaceCloseGenerationFencesSameOwnerABA(t *testing.T) {
 	finished, err := s.FinishEffect(context.Background(), run.ID, StateRunning, "same-owner", second, EffectWorkspaceClose, StateCancelled, "completed", "cancelled", "unverified", "cancelled", "current", later)
 	if err != nil || !finished {
 		t.Fatalf("current finish=%t err=%v", finished, err)
+	}
+}
+
+func TestTerminalWorkspaceClosePreservesClassificationAndUnreadAfterConcurrentInboxUpdates(t *testing.T) {
+	s := testStore(t)
+	now := ts("2026-08-22T01:00:00Z")
+	syncJob(t, s, now.Add(-time.Hour))
+	job := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	runID := "terminal-close"
+	insertAcceptedRun(t, s, runID, snapshotDefinition(t, job), now)
+	if err := s.Finish(context.Background(), runID, StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "terminalized", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.AcceptanceLane != config.AcceptanceAuto || before.Unread {
+		t.Fatalf("unexpected initial classification: %+v", before)
+	}
+	later := now.Add(2 * time.Minute)
+	claimedRun, claim, err := s.ClaimLateProvisioningCleanup(context.Background(), runID, "same-owner", "workspace-1", "pane-1", "auto/job", "/tmp/worktree", StateInterrupted, "uncertain", "not_started", "unverified", "ignored", "ignored", later, later.Add(time.Minute))
+	if err != nil || claim == "" {
+		t.Fatalf("run=%+v claim=%q err=%v", claimedRun, claim, err)
+	}
+	claimedRun, err = s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimedRun.Unread {
+		t.Fatalf("late workspace cleanup must reopen the inbox: %+v", claimedRun)
+	}
+	grouped, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, candidate := range grouped {
+		if candidate.ID == runID {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("terminal workspace cleanup appeared %d times: %+v", seen, grouped)
+	}
+	if err := s.MarkRead(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordRunEvent(context.Background(), runID, "workspace_close_failed", "close unavailable", later.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := s.FinishEffect(context.Background(), runID, StateSucceeded, "same-owner", claim, EffectWorkspaceClose, StateSucceeded, "ignored", "ignored", "failed", "workspace_close_failed", "close unavailable", later.Add(2*time.Second))
+	if err != nil || !finished {
+		t.Fatalf("finished=%t err=%v", finished, err)
+	}
+	after, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.InfrastructureResult != before.InfrastructureResult || after.AgentResult != before.AgentResult || after.TaskVerdict != before.TaskVerdict || after.ErrorCode != before.ErrorCode || after.ErrorDetail != before.ErrorDetail || after.AcceptanceLane != before.AcceptanceLane || after.AcceptanceReason != before.AcceptanceReason || !after.Unread || after.EffectKind != "" || after.EffectOwner != "" || after.EffectClaim != "" || after.EffectReceipt != "" {
+		t.Fatalf("terminal workspace-close mutated run: before=%+v after=%+v", before, after)
 	}
 }
 

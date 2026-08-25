@@ -253,7 +253,7 @@ func runsCmd(args []string) error {
 		return err
 	}
 	defer state.Close()
-	runs, err := state.ListRuns(context.Background(), jobID, *limit)
+	runs, err := state.ListRunsGroupedByAcceptance(context.Background(), jobID, *limit)
 	if err != nil {
 		return err
 	}
@@ -261,13 +261,13 @@ func runsCmd(args []string) error {
 		fmt.Println("No runs.")
 		return nil
 	}
-	fmt.Printf("%-1s %-38s %-22s %-13s %-10s %s\n", "", "RUN", "JOB", "STATE", "VERDICT", "UPDATED")
+	fmt.Printf("%-1s %-38s %-22s %-10s %-11s %-18s %-12s %s\n", "", "RUN", "JOB", "VERDICT", "LANE", "REASON", "STATE", "UPDATED")
 	for _, run := range runs {
 		unread := " "
 		if run.Unread {
 			unread = "*"
 		}
-		fmt.Printf("%-1s %-38s %-22s %-13s %-10s %s\n", unread, run.ID, run.JobID, run.State, run.TaskVerdict, run.UpdatedAt.Local().Format("2006-01-02 15:04"))
+		fmt.Printf("%-1s %-38s %-22s %-10s %-11s %-18s %-12s %s\n", unread, run.ID, run.JobID, run.TaskVerdict, displayField(run.AcceptanceLane), displayField(run.AcceptanceReason), run.State, run.UpdatedAt.Local().Format("2006-01-02 15:04"))
 	}
 	return nil
 }
@@ -290,7 +290,7 @@ func showCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("run: %s\njob: %s\nstate: %s\ninfrastructure: %s\nagent: %s\nverdict: %s\nsource-base: %s\nsource: %s\nworkspace: %s\npane: %s\nworktree: %s\nerror: %s %s\n", run.ID, run.JobID, run.State, run.InfrastructureResult, run.AgentResult, run.TaskVerdict, run.SourceBaseRevision, run.SourceRevision, run.WorkspaceID, run.PaneID, run.WorktreePath, run.ErrorCode, run.ErrorDetail)
+	fmt.Printf("run: %s\njob: %s\nstate: %s\ninfrastructure: %s\nagent: %s\nverdict: %s\nlane: %s\nreason: %s\nsource-base: %s\nsource: %s\nworkspace: %s\npane: %s\nworktree: %s\nerror: %s %s\n", run.ID, run.JobID, run.State, run.InfrastructureResult, run.AgentResult, run.TaskVerdict, displayField(run.AcceptanceLane), displayField(run.AcceptanceReason), run.SourceBaseRevision, run.SourceRevision, run.WorkspaceID, run.PaneID, run.WorktreePath, run.ErrorCode, run.ErrorDetail)
 	return state.MarkRead(context.Background(), run.ID)
 }
 
@@ -546,6 +546,13 @@ func terminal(state string) bool {
 		return true
 	}
 	return false
+}
+
+func displayField(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func defaultConfigPath() string {

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/terry-li-hm/herdr-bots/internal/config"
 	_ "modernc.org/sqlite"
 )
 
@@ -115,12 +116,14 @@ type Run struct {
 	EffectReceipt          string
 	DiskDevice             string
 	DiskReserveGiB         float64
+	AcceptanceLane         string
+	AcceptanceReason       string
 	Unread                 bool
 }
 
 // runColumns is the canonical run projection; every scanner and query must
 // use it so persisted admission fields stay coherent across reads.
-const runColumns = `id,job_id,job_revision,definition,trigger,scheduled_for,state,infrastructure_result,agent_result,task_verdict,accepted_at,accepted_unix_nano,updated_at,workspace_id,pane_id,branch,worktree_path,execution_mode,completion_marker,source_base_revision,source_revision,input_context,error_code,error_detail,provisioning_owner,provisioning_lease_until,effect_owner,effect_claim,effect_kind,effect_lease_until,effect_receipt,disk_device,disk_reserve_gib,unread`
+const runColumns = `id,job_id,job_revision,definition,trigger,scheduled_for,state,infrastructure_result,agent_result,task_verdict,accepted_at,accepted_unix_nano,updated_at,workspace_id,pane_id,branch,worktree_path,execution_mode,completion_marker,source_base_revision,source_revision,input_context,error_code,error_detail,provisioning_owner,provisioning_lease_until,effect_owner,effect_claim,effect_kind,effect_lease_until,effect_receipt,disk_device,disk_reserve_gib,acceptance_lane,acceptance_reason,unread`
 
 type AcceptRequest struct {
 	JobID              string
@@ -356,6 +359,8 @@ CREATE TABLE IF NOT EXISTS runs (
   effect_receipt TEXT NOT NULL DEFAULT '',
   disk_device TEXT NOT NULL DEFAULT '',
   disk_reserve_gib REAL NOT NULL DEFAULT 0,
+  acceptance_lane TEXT NOT NULL DEFAULT '',
+  acceptance_reason TEXT NOT NULL DEFAULT '',
   unread INTEGER NOT NULL DEFAULT 1,
   FOREIGN KEY(job_id) REFERENCES jobs(id)
 );
@@ -394,6 +399,8 @@ CREATE TABLE IF NOT EXISTS metadata (
 		{"runs", "effect_receipt", "TEXT NOT NULL DEFAULT ''"},
 		{"runs", "disk_device", "TEXT NOT NULL DEFAULT ''"},
 		{"runs", "disk_reserve_gib", "REAL NOT NULL DEFAULT 0"},
+		{"runs", "acceptance_lane", "TEXT NOT NULL DEFAULT ''"},
+		{"runs", "acceptance_reason", "TEXT NOT NULL DEFAULT ''"},
 		{"events", "code", "TEXT NOT NULL DEFAULT ''"},
 		{"occurrences", "occurrence_key", "TEXT NOT NULL DEFAULT ''"},
 		{"runs", "source_base_revision", "TEXT NOT NULL DEFAULT ''"},
@@ -408,6 +415,9 @@ CREATE TABLE IF NOT EXISTS metadata (
 		}
 	}
 	if err = backfillTypedAuthority(ctx, conn); err != nil {
+		return err
+	}
+	if err = backfillAcceptanceClassification(ctx, conn); err != nil {
 		return err
 	}
 	if _, err = conn.ExecContext(ctx, `UPDATE occurrences SET occurrence_key=scheduled_for WHERE occurrence_key=''`); err != nil {
@@ -565,6 +575,56 @@ func backfillTypedAuthority(ctx context.Context, conn migrationConnection) error
 	}
 	for _, occurrence := range occurrences {
 		if _, err := conn.ExecContext(ctx, `UPDATE occurrences SET created_unix_nano=? WHERE job_id=? AND occurrence_key=? AND scheduled_for=? AND created_unix_nano=0`, occurrence.instant, occurrence.jobID, occurrence.key, occurrence.scheduledFor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func backfillAcceptanceClassification(ctx context.Context, conn migrationConnection) error {
+	runRows, err := conn.QueryContext(ctx, `SELECT id,definition,state,task_verdict,acceptance_lane,acceptance_reason,unread FROM runs WHERE (acceptance_lane='' OR acceptance_reason='') AND state NOT IN ('accepted','provisioning','starting','running','settled','verifying')`)
+	if err != nil {
+		return err
+	}
+	type acceptanceBackfill struct {
+		id, lane, reason string
+		unread           int
+	}
+	var runs []acceptanceBackfill
+	for runRows.Next() {
+		var id, state, verdict, lane, reason string
+		var definition []byte
+		var unread int
+		if err := runRows.Scan(&id, &definition, &state, &verdict, &lane, &reason, &unread); err != nil {
+			runRows.Close()
+			return err
+		}
+		computedLane, computedReason, reviewUnread := classifyTerminalRun(id, definition, state, verdict)
+		laneWasBlank := strings.TrimSpace(lane) == ""
+		reasonWasBlank := strings.TrimSpace(reason) == ""
+		if laneWasBlank {
+			lane = computedLane
+		}
+		if reasonWasBlank {
+			reason = computedReason
+		}
+		// Only wholly unclassified legacy rows receive the lane's initial inbox
+		// state. A partial precursor row may already reflect a later MarkRead or
+		// RecordRunEvent update, so migration preserves its unread bit exactly.
+		if laneWasBlank && reasonWasBlank {
+			unread = boolInt(reviewUnread)
+		}
+		runs = append(runs, acceptanceBackfill{id: id, lane: lane, reason: reason, unread: unread})
+	}
+	if err := runRows.Err(); err != nil {
+		runRows.Close()
+		return err
+	}
+	if err := runRows.Close(); err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if _, err := conn.ExecContext(ctx, `UPDATE runs SET acceptance_lane=CASE WHEN acceptance_lane='' THEN ? ELSE acceptance_lane END, acceptance_reason=CASE WHEN acceptance_reason='' THEN ? ELSE acceptance_reason END, unread=? WHERE id=? AND (acceptance_lane='' OR acceptance_reason='')`, run.lane, run.reason, run.unread, run.id); err != nil {
 			return err
 		}
 	}
@@ -1267,9 +1327,52 @@ func finishOccurrence(tx *sql.Tx, req AcceptRequest, outcome, detail, runID stri
 	return AcceptResult{Inserted: true, Outcome: outcome, Detail: detail}, nil
 }
 
+func classifyTerminalRun(runID string, definition []byte, state, verdict string) (string, string, bool) {
+	normalizedVerdict := strings.TrimSpace(verdict)
+	if normalizedVerdict == "" {
+		normalizedVerdict = "unverified"
+	}
+	if normalizedVerdict == "failed" {
+		return config.AcceptanceMandatory, "verifier_failed", true
+	}
+	if state != StateSucceeded {
+		if strings.TrimSpace(state) == "" {
+			return config.AcceptanceMandatory, "state_unknown", true
+		}
+		switch state {
+		case StateFailed, StateBlocked, StateTimedOut, StateCancelled, StateInterrupted:
+			return config.AcceptanceMandatory, "state_" + state, true
+		case StateAccepted, StateProvisioning, StateStarting, StateRunning, StateSettled, StateVerifying:
+			return config.AcceptanceMandatory, "state_nonterminal", true
+		default:
+			return config.AcceptanceMandatory, "state_unknown", true
+		}
+	}
+	if normalizedVerdict != "passed" {
+		return config.AcceptanceMandatory, "unverified", true
+	}
+	var snapshot config.Job
+	if err := json.Unmarshal(definition, &snapshot); err != nil {
+		return config.AcceptanceMandatory, "snapshot_invalid", true
+	}
+	return snapshot.ClassifyTerminalRun(runID, state, normalizedVerdict)
+}
+
+func terminalAcceptanceTx(ctx context.Context, tx *sql.Tx, id, state, verdict string) (string, string, int, error) {
+	var definition []byte
+	if err := tx.QueryRowContext(ctx, `SELECT definition FROM runs WHERE id=?`, id).Scan(&definition); err != nil {
+		return "", "", 0, err
+	}
+	lane, reason, unread := classifyTerminalRun(id, definition, state, verdict)
+	return lane, reason, boolInt(unread), nil
+}
+
 func (s *Store) Transition(ctx context.Context, id, from, to, detail string, now time.Time) error {
 	if terminalStates[from] {
 		return fmt.Errorf("run %s is terminal in %s", id, from)
+	}
+	if terminalStates[to] {
+		return fmt.Errorf("run %s cannot transition to terminal state %s; use Finish", id, to)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1294,12 +1397,19 @@ func (s *Store) Finish(ctx context.Context, id, from, state, infra, agent, verdi
 	if !terminalStates[state] {
 		return fmt.Errorf("%s is not terminal", state)
 	}
+	if terminalStates[from] {
+		return fmt.Errorf("run %s is already terminal", id)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?, infrastructure_result=?, agent_result=?, task_verdict=?, error_code=?, error_detail=?, provisioning_owner='', provisioning_lease_until=0, effect_owner='', effect_claim='', effect_kind='', effect_lease_until=0, effect_receipt='', updated_at=? WHERE id=? AND state=? AND effect_owner=''`, state, infra, agent, verdict, code, detail, formatTime(now), id, from)
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
+	if err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?, infrastructure_result=?, agent_result=?, task_verdict=?, error_code=?, error_detail=?, provisioning_owner='', provisioning_lease_until=0, effect_owner='', effect_claim='', effect_kind='', effect_lease_until=0, effect_receipt='', acceptance_lane=?, acceptance_reason=?, unread=?, updated_at=? WHERE id=? AND state=? AND effect_owner=''`, state, infra, agent, verdict, code, detail, lane, reason, unread, formatTime(now), id, from)
 	if err != nil {
 		return err
 	}
@@ -1404,14 +1514,24 @@ func (s *Store) ClaimLateProvisioningCleanup(ctx context.Context, id, owner, wor
 		}
 		return run, "", nil
 	}
-	intent, err := json.Marshal(struct {
-		TerminalState  string `json:"terminal_state"`
-		Infrastructure string `json:"infrastructure"`
-		Agent          string `json:"agent"`
-		Verdict        string `json:"verdict"`
-		Code           string `json:"code"`
-		Detail         string `json:"detail"`
-	}{terminalState, infrastructure, agent, verdict, code, detail})
+	intentPayload := struct {
+		TerminalState    string `json:"terminal_state"`
+		Infrastructure   string `json:"infrastructure"`
+		Agent            string `json:"agent"`
+		Verdict          string `json:"verdict"`
+		Code             string `json:"code"`
+		Detail           string `json:"detail"`
+		AcceptanceLane   string `json:"acceptance_lane,omitempty"`
+		AcceptanceReason string `json:"acceptance_reason,omitempty"`
+		Unread           *bool  `json:"unread,omitempty"`
+	}{TerminalState: terminalState, Infrastructure: infrastructure, Agent: agent, Verdict: verdict, Code: code, Detail: detail}
+	if terminalStates[run.State] {
+		intentPayload.AcceptanceLane = run.AcceptanceLane
+		intentPayload.AcceptanceReason = run.AcceptanceReason
+		unread := run.Unread
+		intentPayload.Unread = &unread
+	}
+	intent, err := json.Marshal(intentPayload)
 	if err != nil {
 		return zero, "", err
 	}
@@ -1514,7 +1634,38 @@ func (s *Store) FinishEffect(ctx context.Context, id, from, owner, claim, kind, 
 	}
 	defer tx.Rollback()
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,effect_owner='',effect_claim='',effect_kind='',effect_lease_until=0,effect_receipt='',updated_at=? WHERE id=? AND state=? AND effect_owner=? AND effect_claim=? AND effect_kind=? AND effect_lease_until>?`, state, infra, agent, verdict, code, detail, stamp, id, from, owner, claim, kind, now.UnixNano())
+	if terminalStates[from] {
+		if kind != EffectWorkspaceClose {
+			return false, fmt.Errorf("run %s is terminal in %s", id, from)
+		}
+		if state != from {
+			return false, fmt.Errorf("run %s terminal state %s cannot change to %s during workspace close", id, from, state)
+		}
+		current, err := scanRun(tx.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id=?`, id))
+		if err != nil {
+			return false, err
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,effect_owner='',effect_claim='',effect_kind='',effect_lease_until=0,effect_receipt='',acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND effect_owner=? AND effect_claim=? AND effect_kind=? AND effect_lease_until>?`, current.State, current.InfrastructureResult, current.AgentResult, current.TaskVerdict, current.ErrorCode, current.ErrorDetail, current.AcceptanceLane, current.AcceptanceReason, boolInt(current.Unread), stamp, id, from, owner, claim, kind, now.UnixNano())
+		if err != nil {
+			return false, err
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			return false, nil
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO events(run_id,from_state,to_state,at,code,detail) VALUES(?,?,?,?,?,?)`, id, from, state, stamp, code, detail); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,effect_owner='',effect_claim='',effect_kind='',effect_lease_until=0,effect_receipt='',acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND effect_owner=? AND effect_claim=? AND effect_kind=? AND effect_lease_until>?`, state, infra, agent, verdict, code, detail, lane, reason, unread, stamp, id, from, owner, claim, kind, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -1542,8 +1693,19 @@ func (s *Store) FinishExpiredVerifier(ctx context.Context, id, state, infra, age
 		return false, err
 	}
 	defer tx.Rollback()
+	var effectKind string
+	if err := tx.QueryRowContext(ctx, `SELECT effect_kind FROM runs WHERE id=?`, id).Scan(&effectKind); err != nil {
+		return false, err
+	}
+	lane, reason, unread := config.AcceptanceMandatory, "legacy_verifier", 1
+	if effectKind == EffectVerifier {
+		lane, reason, unread, err = terminalAcceptanceTx(ctx, tx, id, state, verdict)
+		if err != nil {
+			return false, err
+		}
+	}
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,effect_owner='',effect_claim='',effect_kind='',effect_lease_until=0,effect_receipt='',unread=1,updated_at=? WHERE id=? AND state=? AND ((effect_kind=? AND effect_lease_until<=?) OR (effect_owner='' AND effect_kind=''))`, state, infra, agent, verdict, code, detail, stamp, id, StateVerifying, EffectVerifier, now.UnixNano())
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,effect_owner='',effect_claim='',effect_kind='',effect_lease_until=0,effect_receipt='',acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND ((effect_kind=? AND effect_lease_until<=?) OR (effect_owner='' AND effect_kind=''))`, state, infra, agent, verdict, code, detail, lane, reason, unread, stamp, id, StateVerifying, EffectVerifier, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -1715,6 +1877,60 @@ func (s *Store) ListRuns(ctx context.Context, jobID string, limit int) ([]Run, e
 		out = append(out, run)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ListRunsGroupedByAcceptance(ctx context.Context, jobID string, limit int) ([]Run, error) {
+	terminalsQuery := `SELECT ` + runColumns + ` FROM runs WHERE state NOT IN ('accepted','provisioning','starting','running','settled','verifying') AND effect_kind<>'workspace_close'`
+	activeQuery := `SELECT ` + runColumns + ` FROM runs WHERE (state IN ('accepted','provisioning','starting','running','settled','verifying') OR effect_kind='workspace_close')`
+	args := []any{}
+	if jobID != "" {
+		terminalsQuery += ` AND job_id=?`
+		activeQuery += ` AND job_id=?`
+		args = append(args, jobID)
+	}
+	terminalsQuery += ` ORDER BY CASE
+		WHEN acceptance_lane='sample' THEN 1
+		WHEN acceptance_lane='auto' THEN 2
+		ELSE 0
+	END, accepted_unix_nano DESC,id DESC`
+	if limit > 0 {
+		terminalsQuery += ` LIMIT ?`
+	}
+	terminalArgs := append([]any{}, args...)
+	if limit > 0 {
+		terminalArgs = append(terminalArgs, limit)
+	}
+	activeQuery += ` ORDER BY accepted_unix_nano DESC,id DESC`
+
+	rows, err := s.db.QueryContext(ctx, terminalsQuery, terminalArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Run
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	activeRows, err := s.db.QueryContext(ctx, activeQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer activeRows.Close()
+	for activeRows.Next() {
+		run, err := scanRun(activeRows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, run)
+	}
+	return out, activeRows.Err()
 }
 
 func (s *Store) NonTerminalRuns(ctx context.Context) ([]Run, error) {
@@ -1889,8 +2105,12 @@ func (s *Store) DecideAdmission(ctx context.Context, id, owner, diskDevice strin
 }
 
 func finishAdmissionTx(ctx context.Context, tx *sql.Tx, id, state, infrastructure, code, detail string, now time.Time) error {
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, "unverified")
+	if err != nil {
+		return err
+	}
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result='not_started',task_verdict='unverified',error_code=?,error_detail=?,updated_at=? WHERE id=? AND state=?`, state, infrastructure, code, detail, stamp, id, StateAccepted)
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result='not_started',task_verdict='unverified',error_code=?,error_detail=?,acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=?`, state, infrastructure, code, detail, lane, reason, unread, stamp, id, StateAccepted)
 	if err != nil {
 		return err
 	}
@@ -1960,8 +2180,12 @@ func (s *Store) FinishStartingClaim(ctx context.Context, id, owner, state, infra
 		return false, err
 	}
 	defer tx.Rollback()
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
+	if err != nil {
+		return false, err
+	}
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,updated_at=? WHERE id=? AND state=? AND provisioning_owner=? AND provisioning_lease_until>?`, state, infra, agent, verdict, code, detail, stamp, id, StateStarting, owner, now.UnixNano())
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND provisioning_owner=? AND provisioning_lease_until>?`, state, infra, agent, verdict, code, detail, lane, reason, unread, stamp, id, StateStarting, owner, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -1991,8 +2215,12 @@ func (s *Store) FinishProvisioningClaim(ctx context.Context, id, owner, state, i
 		return false, err
 	}
 	defer tx.Rollback()
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
+	if err != nil {
+		return false, err
+	}
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,updated_at=? WHERE id=? AND state=? AND provisioning_owner=? AND provisioning_lease_until>?`, state, infra, agent, verdict, code, detail, stamp, id, StateProvisioning, owner, now.UnixNano())
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result=?,agent_result=?,task_verdict=?,error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND provisioning_owner=? AND provisioning_lease_until>?`, state, infra, agent, verdict, code, detail, lane, reason, unread, stamp, id, StateProvisioning, owner, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -2018,9 +2246,13 @@ func (s *Store) InterruptExpiredProvisioning(ctx context.Context, id string, now
 		return false, err
 	}
 	defer tx.Rollback()
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, StateInterrupted, "unverified")
+	if err != nil {
+		return false, err
+	}
 	stamp := formatTime(now)
 	detail := "service restarted after the provisioning claim expired before a durable Herdr receipt"
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result='uncertain',agent_result='not_started',task_verdict='unverified',error_code='restart_during_provisioning',error_detail=?,provisioning_owner='',provisioning_lease_until=0,updated_at=? WHERE id=? AND state=? AND workspace_id='' AND (provisioning_owner='' OR provisioning_lease_until<=?) AND effect_owner=''`, StateInterrupted, detail, stamp, id, StateProvisioning, now.UnixNano())
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result='uncertain',agent_result='not_started',task_verdict='unverified',error_code='restart_during_provisioning',error_detail=?,provisioning_owner='',provisioning_lease_until=0,acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND workspace_id='' AND (provisioning_owner='' OR provisioning_lease_until<=?) AND effect_owner=''`, StateInterrupted, detail, lane, reason, unread, stamp, id, StateProvisioning, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -2046,8 +2278,12 @@ func (s *Store) InterruptExpiredStarting(ctx context.Context, id, code, detail s
 		return false, err
 	}
 	defer tx.Rollback()
+	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, StateInterrupted, "unverified")
+	if err != nil {
+		return false, err
+	}
 	stamp := formatTime(now)
-	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result='uncertain',agent_result='not_started',task_verdict='unverified',error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,updated_at=? WHERE id=? AND state=? AND (provisioning_owner='' OR provisioning_lease_until<=?) AND effect_owner=''`, StateInterrupted, code, detail, stamp, id, StateStarting, now.UnixNano())
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET state=?,infrastructure_result='uncertain',agent_result='not_started',task_verdict='unverified',error_code=?,error_detail=?,provisioning_owner='',provisioning_lease_until=0,acceptance_lane=?,acceptance_reason=?,unread=?,updated_at=? WHERE id=? AND state=? AND (provisioning_owner='' OR provisioning_lease_until<=?) AND effect_owner=''`, StateInterrupted, code, detail, lane, reason, unread, stamp, id, StateStarting, now.UnixNano())
 	if err != nil {
 		return false, err
 	}
@@ -2174,7 +2410,7 @@ func scanRun(row scanner) (Run, error) {
 	var accepted, updated string
 	var provisioningLeaseUntil, effectLeaseUntil int64
 	var unread int
-	err := row.Scan(&out.ID, &out.JobID, &out.JobRevision, &out.Definition, &out.Trigger, &scheduled, &out.State, &out.InfrastructureResult, &out.AgentResult, &out.TaskVerdict, &accepted, &out.AcceptedUnixNano, &updated, &out.WorkspaceID, &out.PaneID, &out.Branch, &out.WorktreePath, &out.ExecutionMode, &out.CompletionMarker, &out.SourceBaseRevision, &out.SourceRevision, &out.InputContext, &out.ErrorCode, &out.ErrorDetail, &out.ProvisioningOwner, &provisioningLeaseUntil, &out.EffectOwner, &out.EffectClaim, &out.EffectKind, &effectLeaseUntil, &out.EffectReceipt, &out.DiskDevice, &out.DiskReserveGiB, &unread)
+	err := row.Scan(&out.ID, &out.JobID, &out.JobRevision, &out.Definition, &out.Trigger, &scheduled, &out.State, &out.InfrastructureResult, &out.AgentResult, &out.TaskVerdict, &accepted, &out.AcceptedUnixNano, &updated, &out.WorkspaceID, &out.PaneID, &out.Branch, &out.WorktreePath, &out.ExecutionMode, &out.CompletionMarker, &out.SourceBaseRevision, &out.SourceRevision, &out.InputContext, &out.ErrorCode, &out.ErrorDetail, &out.ProvisioningOwner, &provisioningLeaseUntil, &out.EffectOwner, &out.EffectClaim, &out.EffectKind, &effectLeaseUntil, &out.EffectReceipt, &out.DiskDevice, &out.DiskReserveGiB, &out.AcceptanceLane, &out.AcceptanceReason, &unread)
 	if err != nil {
 		return out, err
 	}
