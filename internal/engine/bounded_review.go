@@ -206,20 +206,22 @@ func (e *Engine) stageBoundedInputs(ctx context.Context, run store.Run, job conf
 // this call created and then failed to finish writing is left where it is: the
 // partial file is evidence, and removing it is not this code's decision.
 func stageOneBoundedInput(root, source, destination string, staged int64) (boundedInputFile, error) {
-	sourceInfo, sourceFile, err := openBoundedSource(source)
+	opened, sourceFile, err := openBoundedSource(source)
 	if err != nil {
 		return boundedInputFile{}, err
 	}
 	defer sourceFile.Close()
 
-	if sourceInfo.Size() > maxBoundedInputFileBytes {
-		return boundedInputFile{}, fmt.Errorf("stage=bound path=%s: source is %d bytes and exceeds the %d byte per-input limit", source, sourceInfo.Size(), int64(maxBoundedInputFileBytes))
+	if opened.Size > maxBoundedInputFileBytes {
+		return boundedInputFile{}, fmt.Errorf("stage=bound path=%s: source is %d bytes and exceeds the %d byte per-input limit", source, opened.Size, int64(maxBoundedInputFileBytes))
 	}
-	if staged+sourceInfo.Size() > maxBoundedInputTotalBytes {
-		return boundedInputFile{}, fmt.Errorf("stage=bound path=%s: staging %d more bytes would exceed the %d byte total input limit", source, sourceInfo.Size(), int64(maxBoundedInputTotalBytes))
+	if staged+opened.Size > maxBoundedInputTotalBytes {
+		return boundedInputFile{}, fmt.Errorf("stage=bound path=%s: staging %d more bytes would exceed the %d byte total input limit", source, opened.Size, int64(maxBoundedInputTotalBytes))
 	}
 	// The copy is bounded independently of the observed size, because a source
-	// outside the workspace may grow between the stat and the read.
+	// outside the workspace may grow between the stat and the read. The bound is
+	// what stops the read; the identity check after it is what refuses the
+	// snapshot such a source would otherwise have produced.
 	remaining := int64(maxBoundedInputFileBytes)
 	if budget := int64(maxBoundedInputTotalBytes) - staged; budget < remaining {
 		remaining = budget
@@ -253,6 +255,9 @@ func stageOneBoundedInput(root, source, destination string, staged int64) (bound
 		return boundedInputFile{}, fmt.Errorf("stage=create path=%s: %w", destination, err)
 	}
 
+	if boundedStageSourceRace != nil {
+		boundedStageSourceRace(source)
+	}
 	hasher := sha256.New()
 	copied, err := io.Copy(io.MultiWriter(file, hasher), io.LimitReader(sourceFile, remaining+1))
 	if err != nil {
@@ -262,6 +267,25 @@ func stageOneBoundedInput(root, source, destination string, staged int64) (bound
 	if copied > remaining {
 		file.Close()
 		return boundedInputFile{}, fmt.Errorf("stage=copy path=%s: source grew past its %d byte bound during the copy", destination, remaining)
+	}
+	// The snapshot is only accepted once the source it came from is proven to
+	// have been the same file, in the same state, for the whole copy. A rewrite
+	// in place keeps the inode and can keep the length, so the timestamps are the
+	// only thing that sees it, and the length equality is what sees a source that
+	// grew or shrank inside the bound: either way the digest below would name
+	// bytes the source never settled on.
+	var settled unix.Stat_t
+	if err := unix.Fstat(int(sourceFile.Fd()), &settled); err != nil {
+		file.Close()
+		return boundedInputFile{}, fmt.Errorf("stage=verify-source path=%s: %w", source, err)
+	}
+	if !boundedSameStatIdentity(opened, settled) {
+		file.Close()
+		return boundedInputFile{}, fmt.Errorf("stage=verify-source path=%s: source changed during snapshot: it was rewritten while it was being copied", source)
+	}
+	if copied != opened.Size {
+		file.Close()
+		return boundedInputFile{}, fmt.Errorf("stage=verify-source path=%s: source changed during snapshot: it was %d bytes when it was opened but %d were copied", source, opened.Size, copied)
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
@@ -280,38 +304,49 @@ func stageOneBoundedInput(root, source, destination string, staged int64) (bound
 	}, nil
 }
 
+// boundedStageSourceRace is nil in production. Like boundedObserveRace it exists
+// so a test can open the window the identity checks around the copy are about:
+// it is called once per staged input, after the source descriptor has been
+// proven to be the file the path named and after the destination has been
+// created, but before a single byte is read, which is exactly where a concurrent
+// writer would land.
+var boundedStageSourceRace func(source string)
+
 // openBoundedSource admits the descriptor rather than a pathname observation.
 // O_NOFOLLOW rejects a final symlink, O_NONBLOCK lets a FIFO be rejected
-// without waiting for a writer, and the fstat/lstat comparison proves the
-// opened inode is the same regular file the path named.
-func openBoundedSource(source string) (os.FileInfo, *os.File, error) {
-	linkInfo, err := os.Lstat(source)
-	if err != nil {
-		return nil, nil, fmt.Errorf("stage=stat-source path=%s: %w", source, err)
+// without waiting for a writer, and the fstat/lstat comparison proves the opened
+// inode is the same regular file, in the same state, the path named. The opened
+// stat is returned rather than an os.FileInfo because the caller compares it
+// again after the copy, and only a unix.Stat_t carries the timestamps that
+// comparison turns on.
+func openBoundedSource(source string) (unix.Stat_t, *os.File, error) {
+	var named unix.Stat_t
+	if err := unix.Lstat(source, &named); err != nil {
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=stat-source path=%s: %w", source, err)
 	}
-	if linkInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, nil, fmt.Errorf("stage=stat-source path=%s: source is a symlink", source)
+	if boundedIsSymlink(named) {
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=stat-source path=%s: source is a symlink", source)
 	}
-	if !linkInfo.Mode().IsRegular() {
-		return nil, nil, fmt.Errorf("stage=stat-source path=%s: source is not a regular file", source)
+	if !boundedIsRegular(named) {
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=stat-source path=%s: source is not a regular file", source)
 	}
 	fd, err := unix.Open(source, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stage=open-source path=%s: %w", source, err)
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=open-source path=%s: %w", source, err)
 	}
 	file := os.NewFile(uintptr(fd), source)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, nil, fmt.Errorf("stage=open-source path=%s: cannot adopt opened descriptor", source)
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=open-source path=%s: cannot adopt opened descriptor", source)
 	}
-	opened, err := file.Stat()
-	if err != nil {
+	var opened unix.Stat_t
+	if err := unix.Fstat(fd, &opened); err != nil {
 		file.Close()
-		return nil, nil, fmt.Errorf("stage=verify-source path=%s: %w", source, err)
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=verify-source path=%s: %w", source, err)
 	}
-	if !opened.Mode().IsRegular() || !os.SameFile(opened, linkInfo) {
+	if !boundedIsRegular(opened) || !boundedSameStatIdentity(named, opened) {
 		file.Close()
-		return nil, nil, fmt.Errorf("stage=verify-source path=%s: source is not the same regular file it was when it was named", source)
+		return unix.Stat_t{}, nil, fmt.Errorf("stage=verify-source path=%s: source is not the same regular file, in the same state, it was when it was named", source)
 	}
 	return opened, file, nil
 }

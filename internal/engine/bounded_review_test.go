@@ -345,6 +345,53 @@ func TestStageBoundedInputsRefusesUnsafeSourceOrDestination(t *testing.T) {
 	}
 }
 
+// A source rewritten in place while it is being staged must not produce a
+// receipt: the snapshot would name bytes the source never settled on, and the
+// digest would be a claim about a file that was moving while it was read. The
+// rewrite keeps the inode and the length, so nothing but the timestamps says it
+// happened, and it is driven from staging itself rather than from a competing
+// goroutine: the window is hit exactly once, every time, with no sleeping.
+func TestStageBoundedInputsRefusesASourceRewrittenDuringTheSnapshot(t *testing.T) {
+	const rewritten = "region,count\nhk,43\n"
+	if len(rewritten) != len(boundedTestContent) {
+		t.Fatalf("the rewrite is %d bytes and the source is %d: the length must not change", len(rewritten), len(boundedTestContent))
+	}
+	f := newBoundedFixture(t, []string{"reports/"})
+
+	rewrites := 0
+	boundedStageSourceRace = func(source string) {
+		if source != f.source {
+			return
+		}
+		rewrites++
+		writeBoundedFile(t, f.source, rewritten)
+		bumpBoundedModTime(t, f.source)
+	}
+	t.Cleanup(func() { boundedStageSourceRace = nil })
+
+	receipt, err := f.engine.stageBoundedInputs(context.Background(), f.run, f.job)
+	if rewrites != 1 {
+		t.Fatalf("the copy window was entered %d times, want exactly 1", rewrites)
+	}
+	if err == nil || !strings.Contains(err.Error(), "source changed during snapshot") {
+		t.Fatalf("err=%v want it to name the rewrite", err)
+	}
+	if !strings.Contains(err.Error(), f.source) {
+		t.Fatalf("err=%v want it to name %q", err, f.source)
+	}
+	if receipt != "" {
+		t.Fatalf("refused staging returned receipt %q", receipt)
+	}
+	if stored, _ := boundedStoredReceipts(t, f.store, f.run.ID); stored != "" {
+		t.Fatalf("refused staging persisted input receipt %q", stored)
+	}
+	// A refusal is not a cleanup. The destination this call created is left where
+	// it is as the evidence of what was copied out of the moving source: the
+	// rewrite landed before the first byte was read, so those are the bytes the
+	// no longer accepted snapshot holds.
+	assertBoundedContent(t, f.staged(), rewritten)
+}
+
 func TestVerifyBoundedReviewRecordsSortedChangesAndRetainsStagedInput(t *testing.T) {
 	f := newBoundedFixture(t, []string{"reports/", "README.md"})
 	writeBoundedFile(t, filepath.Join(f.repo, "reports", "tracked.md"), "tracked\n")
