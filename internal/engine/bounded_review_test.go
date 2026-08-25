@@ -11,9 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/terry-li-hm/herdr-bots/internal/config"
 	"github.com/terry-li-hm/herdr-bots/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 // The accepted instant is deliberately late in the UTC day: 2026-03-09 23:30Z
@@ -589,6 +591,154 @@ func TestVerifyBoundedReviewCountsBothSidesOfATrackedRename(t *testing.T) {
 	}
 	if _, stored := boundedStoredReceipts(t, f.store, f.run.ID); stored != payload {
 		t.Fatalf("persisted change receipt=%q want=%q", stored, payload)
+	}
+}
+
+// The identity comparison is what a same-size in-place rewrite has to get past,
+// so it is proven field by field rather than only through the filesystem.
+func TestBoundedSameStatIdentityNamesEveryFieldItCompares(t *testing.T) {
+	base := unix.Stat_t{
+		Mode: unix.S_IFREG | 0o600,
+		Dev:  17,
+		Ino:  4242,
+		Size: 64,
+		Mtim: unix.Timespec{Sec: 1_700_000_000, Nsec: 123},
+		Ctim: unix.Timespec{Sec: 1_700_000_001, Nsec: 456},
+	}
+	if !boundedSameStatIdentity(base, base) {
+		t.Fatal("a stat does not compare identical to itself")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(stat *unix.Stat_t)
+	}{
+		{"file type", func(stat *unix.Stat_t) { stat.Mode = unix.S_IFLNK | 0o600 }},
+		{"device", func(stat *unix.Stat_t) { stat.Dev++ }},
+		{"inode", func(stat *unix.Stat_t) { stat.Ino++ }},
+		{"size", func(stat *unix.Stat_t) { stat.Size++ }},
+		{"mtime seconds", func(stat *unix.Stat_t) { stat.Mtim.Sec++ }},
+		{"mtime nanoseconds", func(stat *unix.Stat_t) { stat.Mtim.Nsec++ }},
+		{"ctime seconds", func(stat *unix.Stat_t) { stat.Ctim.Sec++ }},
+		{"ctime nanoseconds", func(stat *unix.Stat_t) { stat.Ctim.Nsec++ }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := base
+			tc.mutate(&other)
+			// The comparison is symmetric, so neither direction may accept it.
+			if boundedSameStatIdentity(base, other) || boundedSameStatIdentity(other, base) {
+				t.Fatalf("%s differs but the stats compared identical", tc.name)
+			}
+		})
+	}
+
+	// Two fields are deliberately outside the identity: reading a file moves
+	// atime, and a permission change is not a content change and shows up in
+	// ctime regardless.
+	relaxed := base
+	relaxed.Atim = unix.Timespec{Sec: 1_800_000_000, Nsec: 999}
+	relaxed.Mode = unix.S_IFREG | 0o644
+	if !boundedSameStatIdentity(base, relaxed) {
+		t.Fatal("atime or permission bits alone were treated as a change")
+	}
+}
+
+// bumpBoundedModTime moves a path's timestamps forward by a whole second. The
+// rewrites below already move them, on any filesystem that keeps sub-second
+// precision; this makes the fixtures prove the check rather than the clock's
+// granularity, without waiting for either.
+func bumpBoundedModTime(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := info.ModTime().Add(time.Second)
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A run that rewrites a changed path while that path is being fingerprinted
+// must not get a receipt: the digest would describe content the worktree never
+// settled on. The rewrite is driven from the observation itself rather than
+// from a competing goroutine, so the window is hit exactly once, every time.
+func TestVerifyBoundedReviewRefusesAPathRewrittenDuringFingerprint(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		want    string
+		arrange func(t *testing.T, repo string) string
+		rewrite func(t *testing.T, repo string)
+	}{
+		{
+			name: "regular file rewritten in place at the same length",
+			want: "changed file was rewritten while it was being fingerprinted",
+			arrange: func(t *testing.T, repo string) string {
+				writeBoundedFile(t, filepath.Join(repo, "reports", "summary.md"), "first\n")
+				return "reports/summary.md"
+			},
+			rewrite: func(t *testing.T, repo string) {
+				// Same inode, same six bytes of length, different content: only
+				// the timestamps can say this happened.
+				report := filepath.Join(repo, "reports", "summary.md")
+				writeBoundedFile(t, report, "fir5t\n")
+				bumpBoundedModTime(t, report)
+			},
+		},
+		{
+			name: "symlink replaced by one with a target of the same length",
+			want: "symlink was rewritten while it was being fingerprinted",
+			arrange: func(t *testing.T, repo string) string {
+				if err := os.MkdirAll(filepath.Join(repo, "reports"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("target-a", filepath.Join(repo, "reports", "link")); err != nil {
+					t.Fatal(err)
+				}
+				return "reports/link"
+			},
+			rewrite: func(t *testing.T, repo string) {
+				link := filepath.Join(repo, "reports", "link")
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("target-b", link); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBoundedFixture(t, []string{"reports/"}).stage(t)
+			observed := tc.arrange(t, f.repo)
+
+			rewrites := 0
+			boundedObserveRace = func(path string) {
+				if path != observed {
+					return
+				}
+				rewrites++
+				tc.rewrite(t, f.repo)
+			}
+			t.Cleanup(func() { boundedObserveRace = nil })
+
+			payload, err := f.engine.verifyBoundedReview(context.Background(), f.run, f.job)
+			if rewrites != 1 {
+				t.Fatalf("the fingerprint window was entered %d times, want exactly 1", rewrites)
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want it to contain %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), observed) {
+				t.Fatalf("err=%v want it to name %q", err, observed)
+			}
+			if payload != "" {
+				t.Fatalf("refused observation returned receipt %q", payload)
+			}
+			if _, stored := boundedStoredReceipts(t, f.store, f.run.ID); stored != "" {
+				t.Fatalf("refused observation persisted change receipt %q", stored)
+			}
+		})
 	}
 }
 

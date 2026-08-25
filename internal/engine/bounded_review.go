@@ -566,11 +566,17 @@ func boundedObserveOnePath(root, path string) (boundedPathState, error) {
 	return boundedPathState{}, errors.New("changed path is neither a regular file nor a symlink")
 }
 
+// boundedObserveRace is nil in production. It exists so a test can open the
+// window this file's identity checks are about: it is called once per changed
+// path, after that path's state has been observed and before its content is
+// read, which is exactly where a concurrent writer would land.
+var boundedObserveRace func(path string)
+
 // boundedObserveRegularFile hashes the bytes behind an opened descriptor. The
-// fstat proves the descriptor is the same inode and length the directory entry
-// named, and the read is bounded by that length, so a file being rewritten
-// underneath the observation is reported as a race instead of being recorded
-// as a state that never existed.
+// fstat before the read proves the descriptor is the same file in the same
+// state the directory entry named, and the fstat after it proves that state
+// held for the whole read: a rewrite that kept the inode and the length would
+// otherwise be recorded as a digest of content the worktree never settled on.
 func boundedObserveRegularFile(parentFD int, root, path, name string, named unix.Stat_t) (boundedPathState, error) {
 	if named.Size < 0 || named.Size > maxBoundedChangeFileBytes {
 		return boundedPathState{}, fmt.Errorf("changed file is %d bytes and exceeds the %d byte per-path limit", named.Size, int64(maxBoundedChangeFileBytes))
@@ -592,8 +598,11 @@ func boundedObserveRegularFile(parentFD int, root, path, name string, named unix
 	if err := unix.Fstat(fd, &opened); err != nil {
 		return boundedPathState{}, err
 	}
-	if !boundedIsRegular(opened) || opened.Dev != named.Dev || opened.Ino != named.Ino || opened.Size != named.Size {
+	if !boundedSameStatIdentity(named, opened) {
 		return boundedPathState{}, errors.New("changed file changed while it was being opened")
+	}
+	if boundedObserveRace != nil {
+		boundedObserveRace(path)
 	}
 	hasher := sha256.New()
 	read, err := io.Copy(hasher, io.LimitReader(handle, named.Size+1))
@@ -602,6 +611,17 @@ func boundedObserveRegularFile(parentFD int, root, path, name string, named unix
 	}
 	if read != named.Size {
 		return boundedPathState{}, fmt.Errorf("changed file was %d bytes when it was named but %d were read", named.Size, read)
+	}
+	// The digest is only returned once the file it came from is proven to have
+	// been the same file, in the same state, for the whole read. A rewrite in
+	// place keeps the inode and can keep the length, so this is the check that
+	// sees it at all.
+	var settled unix.Stat_t
+	if err := unix.Fstat(fd, &settled); err != nil {
+		return boundedPathState{}, err
+	}
+	if !boundedSameStatIdentity(opened, settled) {
+		return boundedPathState{}, errors.New("changed file was rewritten while it was being fingerprinted")
 	}
 	return boundedPathState{
 		Path:   path,
@@ -614,10 +634,15 @@ func boundedObserveRegularFile(parentFD int, root, path, name string, named unix
 // boundedObserveSymlink fingerprints the text a symlink holds and never what it
 // points at. Following it would read content from anywhere on the host and
 // record it under a repository path, which is the opposite of what this receipt
-// claims.
+// claims. A symlink cannot be edited, only replaced, so the target is read and
+// then the name is stat'd again: the digest is returned only if it describes
+// the same link, of exactly the length that link was named with.
 func boundedObserveSymlink(parentFD int, path, name string, named unix.Stat_t) (boundedPathState, error) {
 	if named.Size < 1 || named.Size > maxBoundedChangeFileBytes {
 		return boundedPathState{}, fmt.Errorf("symlink target length %d is out of range", named.Size)
+	}
+	if boundedObserveRace != nil {
+		boundedObserveRace(path)
 	}
 	// The extra byte turns a target that grew between the stat and the read into
 	// a short buffer this can detect rather than a silently truncated digest.
@@ -626,8 +651,17 @@ func boundedObserveSymlink(parentFD int, path, name string, named unix.Stat_t) (
 	if err != nil {
 		return boundedPathState{}, err
 	}
-	if read < 1 || int64(read) > named.Size {
+	// A shorter target is as much a replacement as a longer one, so the length
+	// must match exactly rather than merely fit.
+	if int64(read) != named.Size {
 		return boundedPathState{}, errors.New("symlink target changed while it was being read")
+	}
+	var settled unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &settled, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return boundedPathState{}, err
+	}
+	if !boundedSameStatIdentity(named, settled) {
+		return boundedPathState{}, errors.New("symlink was rewritten while it was being fingerprinted")
 	}
 	digest := sha256.Sum256(buffer[:read])
 	return boundedPathState{
@@ -1133,6 +1167,29 @@ func boundedIsDir(stat unix.Stat_t) bool { return stat.Mode&unix.S_IFMT == unix.
 func boundedIsRegular(stat unix.Stat_t) bool { return stat.Mode&unix.S_IFMT == unix.S_IFREG }
 
 func boundedIsSymlink(stat unix.Stat_t) bool { return stat.Mode&unix.S_IFMT == unix.S_IFLNK }
+
+// boundedSameStatIdentity reports whether two observations describe the same
+// file in the same state. Identity alone would not: a writer that rewrites a
+// file in place, or replaces its content with content of the same length,
+// leaves the kind, device, inode, and size exactly as they were, and an
+// observation comparing only those would hash bytes from one state and record
+// them as another. The timestamps are what make that visible. mtime moves when
+// content is written, and ctime moves whenever the inode is touched at all,
+// including by the utimes call a writer would need to put mtime back, so a
+// rewrite has to move at least one of them.
+//
+// Only the file type is taken from the mode. A permission change is not a
+// content change, and it already surfaces in ctime. Access time is left out for
+// the opposite reason: reading a file moves it, so comparing it would report
+// every observation as a change.
+func boundedSameStatIdentity(a, b unix.Stat_t) bool {
+	return a.Mode&unix.S_IFMT == b.Mode&unix.S_IFMT &&
+		a.Dev == b.Dev &&
+		a.Ino == b.Ino &&
+		a.Size == b.Size &&
+		a.Mtim.Sec == b.Mtim.Sec && a.Mtim.Nsec == b.Mtim.Nsec &&
+		a.Ctim.Sec == b.Ctim.Sec && a.Ctim.Nsec == b.Ctim.Nsec
+}
 
 func isSHA256Hex(value string) bool {
 	if len(value) != sha256.Size*2 {
