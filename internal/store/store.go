@@ -1405,6 +1405,9 @@ func (s *Store) Finish(ctx context.Context, id, from, state, infra, agent, verdi
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return err
+	}
 	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
 	if err != nil {
 		return err
@@ -1633,6 +1636,9 @@ func (s *Store) FinishEffect(ctx context.Context, id, from, owner, claim, kind, 
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	stamp := formatTime(now)
 	if terminalStates[from] {
 		if kind != EffectWorkspaceClose {
@@ -1693,6 +1699,9 @@ func (s *Store) FinishExpiredVerifier(ctx context.Context, id, state, infra, age
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	var effectKind string
 	if err := tx.QueryRowContext(ctx, `SELECT effect_kind FROM runs WHERE id=?`, id).Scan(&effectKind); err != nil {
 		return false, err
@@ -1902,21 +1911,27 @@ func (s *Store) ListRunsGroupedByAcceptance(ctx context.Context, jobID string, l
 	}
 	activeQuery += ` ORDER BY accepted_unix_nano DESC,id DESC`
 
-	rows, err := s.db.QueryContext(ctx, terminalsQuery, terminalArgs...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []Run
-	for rows.Next() {
-		run, err := scanRun(rows)
+	if limit != 0 {
+		rows, err := s.db.QueryContext(ctx, terminalsQuery, terminalArgs...)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, run)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		for rows.Next() {
+			run, err := scanRun(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, run)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
 	activeRows, err := s.db.QueryContext(ctx, activeQuery, args...)
 	if err != nil {
@@ -2350,6 +2365,9 @@ func (s *Store) RecordRunEvent(ctx context.Context, id, code, detail string, now
 		return err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return err
+	}
 	var state string
 	if err := tx.QueryRowContext(ctx, `SELECT state FROM runs WHERE id=?`, id).Scan(&state); err != nil {
 		return err

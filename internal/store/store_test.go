@@ -26,6 +26,71 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
+func sharedStores(t *testing.T) (*Store, *Store) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "shared.sqlite3")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path)
+	if err != nil {
+		_ = first.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = second.Close()
+		_ = first.Close()
+	})
+	return first, second
+}
+
+func holdUnreadWrite(t *testing.T, state *Store, runID string, unread bool) *sql.Tx {
+	t.Helper()
+	tx, err := state.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tx.Exec(`UPDATE runs SET unread=? WHERE id=?`, boolInt(unread), runID)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		_ = tx.Rollback()
+		t.Fatalf("held write updated %d rows for %s", count, runID)
+	}
+	return tx
+}
+
+func completeAfterHeldWrite(t *testing.T, held *sql.Tx, operation func() error) {
+	t.Helper()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- operation()
+	}()
+	<-started
+	select {
+	case err := <-done:
+		_ = held.Rollback()
+		t.Fatalf("operation returned before the held write committed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("operation failed after the held write committed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("operation did not settle after the held write committed")
+	}
+}
+
 func ts(value string) time.Time { return must(time.Parse(time.RFC3339, value)) }
 func must[T any](v T, err error) T {
 	if err != nil {
@@ -411,6 +476,185 @@ func TestFinishPersistsAcceptanceLaneReasonAndUnread(t *testing.T) {
 	}
 }
 
+func TestAcceptanceWritesReserveBeforeReadsAcrossHandles(t *testing.T) {
+	autoJob := config.Job{ID: "job", Verifier: &config.Verifier{Command: []string{"git", "diff", "--check"}}, Acceptance: &config.Acceptance{Mode: config.AcceptanceAuto}}
+	definition := snapshotDefinition(t, autoJob)
+	base := ts("2026-08-22T01:00:00Z")
+
+	t.Run("finish terminalization", func(t *testing.T) {
+		first, second := sharedStores(t)
+		syncJob(t, first, base.Add(-time.Hour))
+		insertAcceptedRun(t, first, "contended-finish", definition, base)
+		held := holdUnreadWrite(t, first, "contended-finish", true)
+		completeAfterHeldWrite(t, held, func() error {
+			return second.Finish(context.Background(), "contended-finish", StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "finished", base.Add(time.Second))
+		})
+		run, err := first.GetRun(context.Background(), "contended-finish")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.State != StateSucceeded || run.AcceptanceLane != config.AcceptanceAuto || run.Unread {
+			t.Fatalf("contended finish lost terminal state: %+v", run)
+		}
+	})
+
+	t.Run("verifier effect terminalization", func(t *testing.T) {
+		first, second := sharedStores(t)
+		syncJob(t, first, base.Add(-time.Hour))
+		insertAcceptedRun(t, first, "contended-effect", definition, base)
+		if err := first.Transition(context.Background(), "contended-effect", StateAccepted, StateRunning, "started", base); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Transition(context.Background(), "contended-effect", StateRunning, StateSettled, "settled", base); err != nil {
+			t.Fatal(err)
+		}
+		claim, _, err := first.ClaimVerifier(context.Background(), "contended-effect", "verifier", base, base.Add(time.Minute))
+		if err != nil || claim == "" {
+			t.Fatalf("claim=%q err=%v", claim, err)
+		}
+		held := holdUnreadWrite(t, first, "contended-effect", true)
+		completeAfterHeldWrite(t, held, func() error {
+			finished, err := second.FinishEffect(context.Background(), "contended-effect", StateVerifying, "verifier", claim, EffectVerifier, StateSucceeded, "completed", "completed", "passed", "verified", "verified", base.Add(30*time.Second))
+			if err != nil {
+				return err
+			}
+			if !finished {
+				return errors.New("verifier completion lost its claim")
+			}
+			return nil
+		})
+		run, err := first.GetRun(context.Background(), "contended-effect")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.State != StateSucceeded || run.AcceptanceLane != config.AcceptanceAuto || run.Unread {
+			t.Fatalf("contended effect lost terminal state: %+v", run)
+		}
+	})
+
+	t.Run("terminal workspace close preserves inbox ordering", func(t *testing.T) {
+		first, second := sharedStores(t)
+		syncJob(t, first, base.Add(-time.Hour))
+		insertAcceptedRun(t, first, "contended-close", definition, base)
+		if err := first.Finish(context.Background(), "contended-close", StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "finished", base.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		_, claim, err := first.ClaimLateProvisioningCleanup(context.Background(), "contended-close", "closer", "workspace-1", "pane-1", "auto/job", "/tmp/worktree", StateInterrupted, "uncertain", "not_started", "unverified", "ignored", "ignored", base.Add(2*time.Second), base.Add(4*time.Minute))
+		if err != nil || claim == "" {
+			t.Fatalf("claim=%q err=%v", claim, err)
+		}
+		held := holdUnreadWrite(t, first, "contended-close", false)
+		completeAfterHeldWrite(t, held, func() error {
+			finished, err := second.FinishEffect(context.Background(), "contended-close", StateSucceeded, "closer", claim, EffectWorkspaceClose, StateSucceeded, "ignored", "ignored", "failed", "workspace_closed", "closed", base.Add(3*time.Second))
+			if err != nil {
+				return err
+			}
+			if !finished {
+				return errors.New("workspace-close completion lost its claim")
+			}
+			return nil
+		})
+		run, err := first.GetRun(context.Background(), "contended-close")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Unread || run.EffectKind != "" || run.AcceptanceLane != config.AcceptanceAuto {
+			t.Fatalf("workspace-close completion lost the earlier mark-read: %+v", run)
+		}
+		if err := second.RecordRunEvent(context.Background(), run.ID, "workspace_close_notice", "later evidence", base.Add(4*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		run, err = first.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !run.Unread {
+			t.Fatalf("later event did not reopen unread: %+v", run)
+		}
+		if err := first.MarkRead(context.Background(), run.ID); err != nil {
+			t.Fatal(err)
+		}
+		run, err = second.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Unread {
+			t.Fatalf("later mark-read was lost: %+v", run)
+		}
+	})
+
+	t.Run("expired verifier completion", func(t *testing.T) {
+		first, second := sharedStores(t)
+		syncJob(t, first, base.Add(-time.Hour))
+		insertAcceptedRun(t, first, "contended-verifier", definition, base)
+		if err := first.Transition(context.Background(), "contended-verifier", StateAccepted, StateRunning, "started", base); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.Transition(context.Background(), "contended-verifier", StateRunning, StateSettled, "settled", base); err != nil {
+			t.Fatal(err)
+		}
+		claim, _, err := first.ClaimVerifier(context.Background(), "contended-verifier", "verifier", base, base.Add(time.Minute))
+		if err != nil || claim == "" {
+			t.Fatalf("claim=%q err=%v", claim, err)
+		}
+		held := holdUnreadWrite(t, first, "contended-verifier", true)
+		completeAfterHeldWrite(t, held, func() error {
+			finished, err := second.FinishExpiredVerifier(context.Background(), "contended-verifier", StateSucceeded, "completed", "completed", "passed", "verified", "durable verifier result", base.Add(2*time.Minute))
+			if err != nil {
+				return err
+			}
+			if !finished {
+				return errors.New("expired verifier completion lost its claim")
+			}
+			return nil
+		})
+		run, err := first.GetRun(context.Background(), "contended-verifier")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.State != StateSucceeded || run.AcceptanceLane != config.AcceptanceAuto || run.Unread {
+			t.Fatalf("contended expired verifier lost completion: %+v", run)
+		}
+	})
+
+	t.Run("record event reopens after contended mark-read", func(t *testing.T) {
+		first, second := sharedStores(t)
+		syncJob(t, first, base.Add(-time.Hour))
+		insertAcceptedRun(t, first, "contended-event", definition, base)
+		if err := first.Finish(context.Background(), "contended-event", StateAccepted, StateSucceeded, "completed", "completed", "passed", "", "finished", base.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		held := holdUnreadWrite(t, first, "contended-event", false)
+		completeAfterHeldWrite(t, held, func() error {
+			return second.RecordRunEvent(context.Background(), "contended-event", "late_evidence", "recorded", base.Add(2*time.Second))
+		})
+		run, err := first.GetRun(context.Background(), "contended-event")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !run.Unread {
+			t.Fatalf("contended event did not reopen unread: %+v", run)
+		}
+		events, err := first.Events(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) == 0 || events[len(events)-1].Code != "late_evidence" {
+			t.Fatalf("contended event evidence was dropped: %+v", events)
+		}
+		if err := second.MarkRead(context.Background(), run.ID); err != nil {
+			t.Fatal(err)
+		}
+		run, err = first.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Unread {
+			t.Fatalf("later mark-read was lost after event: %+v", run)
+		}
+	})
+}
+
 func TestListRunsGroupedByAcceptanceOrdersMandatorySampleAutoThenActive(t *testing.T) {
 	s := testStore(t)
 	now := ts("2026-08-22T01:00:00Z")
@@ -475,6 +719,20 @@ func TestListRunsGroupedByAcceptanceKeepsActiveRunsVisibleUnderLimit(t *testing.
 	}
 	if len(runs) != 2 || runs[0].State != StateSucceeded || runs[1].ID != activeID || runs[1].State != StateAccepted {
 		t.Fatalf("runs=%+v", runs)
+	}
+	zero, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(zero) != 1 || zero[0].ID != activeID {
+		t.Fatalf("limit zero returned terminal history or hid active work: %+v", zero)
+	}
+	unlimited, err := s.ListRunsGroupedByAcceptance(context.Background(), "job", -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unlimited) != 4 || unlimited[len(unlimited)-1].ID != activeID {
+		t.Fatalf("negative limit was not unlimited terminal history plus active work: %+v", unlimited)
 	}
 }
 

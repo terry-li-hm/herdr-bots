@@ -442,6 +442,20 @@ func TestRunsAndShowDisplayAcceptanceGroupingAndLegacyFields(t *testing.T) {
 			t.Fatalf("runs output missing %q:\n%s", want, runsOutput)
 		}
 	}
+	zeroOutput, err := captureRunStdout(t, func() error {
+		return run([]string{"runs", "--limit", "0", "--state", statePath})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(zeroOutput, active.ID) {
+		t.Fatalf("limit zero hid active work:\n%s", zeroOutput)
+	}
+	for _, terminalID := range []string{mandatory.ID, sample.ID, auto.ID} {
+		if strings.Contains(zeroOutput, terminalID) {
+			t.Fatalf("limit zero included terminal history %s:\n%s", terminalID, zeroOutput)
+		}
+	}
 	showOutput, err := captureRunStdout(t, func() error {
 		return run([]string{"show", active.ID, "--state", statePath})
 	})
