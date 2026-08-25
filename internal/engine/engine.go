@@ -1019,6 +1019,30 @@ func (e *Engine) completeCommand(ctx context.Context, run store.Run, code int) {
 		e.recordMonitoredPersistence(run.ID, e.Store.Finish(ctx, run.ID, run.State, store.StateFailed, "completed", "failed", "unverified", "command_failed", fmt.Sprintf("headless harness command exited %d", code), time.Now()))
 		return
 	}
+	failAttestation := func(detail string) {
+		e.recordMonitoredPersistence(run.ID, e.Store.Finish(ctx, run.ID, run.State, store.StateFailed, "completed", "failed", "unverified", "model_attestation_failed", detail, e.now()))
+	}
+	var job config.Job
+	if err := json.Unmarshal(run.Definition, &job); err != nil {
+		failAttestation("stage=snapshot; " + err.Error())
+		return
+	}
+	if job.Execution.RequiresModelAttestation() && run.ModelAttestation == "" {
+		transcript, err := e.Herdr.CommandTranscript(ctx, run.PaneID)
+		if err != nil {
+			failAttestation("stage=transcript; " + err.Error())
+			return
+		}
+		receipt, err := adapter.ParseClaudeModelAttestation(transcript, run.CompletionMarker, job.Execution.Model)
+		if err != nil {
+			failAttestation("stage=parse; " + err.Error())
+			return
+		}
+		if err := e.Store.SetModelAttestation(ctx, run.ID, receipt); err != nil {
+			failAttestation("stage=persist; " + err.Error())
+			return
+		}
+	}
 	e.monitor(ctx, run, "idle")
 }
 

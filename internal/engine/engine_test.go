@@ -89,6 +89,37 @@ type fakeHerdr struct {
 	foundWorkspace    bool
 	workspaceExists   bool
 	workspaceExistSet bool
+
+	commandTranscript      string
+	commandTranscriptErr   error
+	commandTranscriptCalls int
+}
+
+func (f *fakeHerdr) CommandTranscript(context.Context, string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commandTranscriptCalls++
+	// A configured transcript is written before the run exists, so it carries a
+	// placeholder where the pane would show this run's completion status. The
+	// marker the engine actually launched is the one the parser must observe.
+	transcript := strings.ReplaceAll(f.commandTranscript, "{{MARKER}}", markerFromCommand(f.command))
+	return transcript, f.commandTranscriptErr
+}
+
+// markerFromCommand recovers the completion marker the engine embedded in the
+// launched command line: everything from the marker prefix up to its status
+// separator.
+func markerFromCommand(command string) string {
+	at := strings.Index(command, "HERDR_BOTS_RUN_")
+	if at < 0 {
+		return ""
+	}
+	rest := command[at:]
+	colon := strings.Index(rest, ":")
+	if colon < 0 {
+		return ""
+	}
+	return rest[:colon]
 }
 
 func (f *fakeHerdr) WorkspaceExists(context.Context, string) (bool, error) {
@@ -705,6 +736,10 @@ func TestClaudeUsesHeadlessNativeCommandWithoutTrustApproval(t *testing.T) {
 	defer client.mu.Unlock()
 	if client.kind != "" || !strings.Contains(client.command, "'claude' -p") || !strings.Contains(client.command, "--safe-mode") || !strings.Contains(client.command, "'--tools' 'Read,Glob,Grep'") {
 		t.Fatalf("unexpected Claude launch: kind=%q command=%q", client.kind, client.command)
+	}
+	// A job that never opted into attestation must not read the pane transcript.
+	if client.commandTranscriptCalls != 0 {
+		t.Fatalf("unattested Claude run read the transcript %d times", client.commandTranscriptCalls)
 	}
 }
 

@@ -3,9 +3,13 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/terry-li-hm/herdr-bots/internal/config"
@@ -133,6 +137,150 @@ func LaunchFor(job config.Job) (Launch, error) {
 	default:
 		return Launch{}, fmt.Errorf("unsupported harness %q", job.Execution.Harness)
 	}
+}
+
+// ClaudeAttestationVersion is the schema version of the model attestation
+// receipt. It is part of the durable receipt, so it changes only when the
+// meaning of the receipt changes.
+const ClaudeAttestationVersion = 1
+
+// claudeFirstPartyProvider is the only provider that can satisfy the attested
+// launch contract: a first-party Anthropic route is what the configured model
+// name identifies.
+const claudeFirstPartyProvider = "firstParty"
+
+const attestationFailure = "model_attestation_unverified"
+
+type claudeAttestation struct {
+	Version       int    `json:"version"`
+	ExpectedModel string `json:"expected_model"`
+	ObservedModel string `json:"observed_model"`
+	Provider      string `json:"provider"`
+	ResultSHA256  string `json:"result_sha256"`
+	Verdict       string `json:"verdict"`
+}
+
+type claudeModelUsage struct {
+	CanonicalModel string `json:"canonicalModel"`
+	Provider       string `json:"provider"`
+	InputTokens    int64  `json:"inputTokens"`
+	OutputTokens   int64  `json:"outputTokens"`
+}
+
+// ParseClaudeModelAttestation binds a finished Claude invocation to the model
+// the job configured, using only evidence the harness itself printed. It is
+// pure: the observed transcript, the run's completion marker, and the expected
+// model are the whole input.
+//
+// Only lines before the first completion status for this marker are evidence,
+// so a later pane write can never supply the result. The last line that
+// independently parses as a Claude single-result object is the one the marker
+// reported on; absent, malformed, mismatched, or unused-model evidence is an
+// error rather than a weaker verdict. The returned receipt is deterministic
+// compact JSON, so the same transcript always yields the same durable bytes.
+func ParseClaudeModelAttestation(transcript, completionMarker, expectedModel string) (string, error) {
+	if completionMarker == "" {
+		return "", fmt.Errorf("%s: a completion marker is required", attestationFailure)
+	}
+	if expectedModel == "" {
+		return "", fmt.Errorf("%s: an expected model is required", attestationFailure)
+	}
+	lines := strings.Split(transcript, "\n")
+	boundary := -1
+	for i, line := range lines {
+		if hasCompletionStatus(line, completionMarker) {
+			boundary = i
+			break
+		}
+	}
+	if boundary < 0 {
+		return "", fmt.Errorf("%s: no %s completion status is present in the transcript", attestationFailure, completionMarker)
+	}
+	line, usage, found := lastClaudeResultLine(lines[:boundary])
+	if !found {
+		return "", fmt.Errorf("%s: no Claude result JSON precedes the %s completion status", attestationFailure, completionMarker)
+	}
+	rawUsage, ok := usage[expectedModel]
+	if !ok {
+		return "", fmt.Errorf("%s: the result reports usage for %s, not the configured model %q", attestationFailure, observedModels(usage), expectedModel)
+	}
+	var entry claudeModelUsage
+	if err := json.Unmarshal(rawUsage, &entry); err != nil {
+		return "", fmt.Errorf("%s: usage for %q is malformed: %w", attestationFailure, expectedModel, err)
+	}
+	if entry.Provider != claudeFirstPartyProvider {
+		return "", fmt.Errorf("%s: usage for %q reports provider %q, want %q", attestationFailure, expectedModel, entry.Provider, claudeFirstPartyProvider)
+	}
+	if entry.CanonicalModel == "" {
+		return "", fmt.Errorf("%s: usage for %q reports no canonical model", attestationFailure, expectedModel)
+	}
+	if entry.InputTokens <= 0 && entry.OutputTokens <= 0 {
+		return "", fmt.Errorf("%s: usage for %q reports no input or output tokens", attestationFailure, expectedModel)
+	}
+	sum := sha256.Sum256([]byte(line))
+	receipt, err := json.Marshal(claudeAttestation{
+		Version:       ClaudeAttestationVersion,
+		ExpectedModel: expectedModel,
+		ObservedModel: entry.CanonicalModel,
+		Provider:      entry.Provider,
+		ResultSHA256:  hex.EncodeToString(sum[:]),
+		Verdict:       "attested",
+	})
+	if err != nil {
+		return "", fmt.Errorf("%s: encode receipt: %w", attestationFailure, err)
+	}
+	return string(receipt), nil
+}
+
+// hasCompletionStatus reports whether a line carries this marker's exit status,
+// which is the same `marker:<code>` evidence the command waiter observes.
+func hasCompletionStatus(line, marker string) bool {
+	rest := line
+	for {
+		at := strings.Index(rest, marker+":")
+		if at < 0 {
+			return false
+		}
+		rest = rest[at+len(marker)+1:]
+		if len(rest) > 0 && rest[0] >= '0' && rest[0] <= '9' {
+			return true
+		}
+	}
+}
+
+// lastClaudeResultLine returns the exact untrimmed line, and its model usage,
+// for the last line that on its own is a Claude single-result JSON object.
+// Partial or wrapped output never qualifies, because each candidate line must
+// parse completely by itself.
+func lastClaudeResultLine(lines []string) (string, map[string]json.RawMessage, bool) {
+	for i := len(lines) - 1; i >= 0; i-- {
+		var object map[string]json.RawMessage
+		if json.Unmarshal([]byte(lines[i]), &object) != nil {
+			continue
+		}
+		var kind string
+		if json.Unmarshal(object["type"], &kind) != nil || kind != "result" {
+			continue
+		}
+		var usage map[string]json.RawMessage
+		if json.Unmarshal(object["modelUsage"], &usage) != nil || usage == nil {
+			continue
+		}
+		return lines[i], usage, true
+	}
+	return "", nil, false
+}
+
+func observedModels(usage map[string]json.RawMessage) string {
+	if len(usage) == 0 {
+		return "no model"
+	}
+	names := make([]string, 0, len(usage))
+	for name := range usage {
+		names = append(names, strconv.Quote(name))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func piModelPresent(table, provider, model string) bool {

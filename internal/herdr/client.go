@@ -32,6 +32,7 @@ type Client interface {
 	StartCommand(ctx context.Context, paneID, command string) error
 	WaitCommand(ctx context.Context, paneID, marker string, timeout time.Duration) (int, error)
 	CommandResult(ctx context.Context, paneID, marker string) (int, bool, error)
+	CommandTranscript(ctx context.Context, paneID string) (string, error)
 	CloseWorkspace(ctx context.Context, workspaceID string) error
 }
 
@@ -421,8 +422,20 @@ func (c *CLI) WaitCommand(ctx context.Context, paneID, marker string, timeout ti
 	}
 }
 
+// commandTranscriptLines is the recent-output window for command panes. The
+// completion status and the harness result that precedes it must be observed in
+// the same window, so status and transcript reads use one bound.
+const commandTranscriptLines = 200
+
+// CommandTranscript returns the recent unwrapped output of a command pane. It
+// reads exactly the window CommandResult observes the completion status in, so
+// a caller inspecting the transcript sees the same evidence.
+func (c *CLI) CommandTranscript(ctx context.Context, paneID string) (string, error) {
+	return c.paneRead(ctx, paneID, commandTranscriptLines)
+}
+
 func (c *CLI) CommandResult(ctx context.Context, paneID, marker string) (int, bool, error) {
-	screen, err := c.paneRead(ctx, paneID, 200)
+	screen, err := c.paneRead(ctx, paneID, commandTranscriptLines)
 	if err != nil {
 		return 0, false, err
 	}
