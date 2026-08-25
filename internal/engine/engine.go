@@ -1289,9 +1289,28 @@ exit($status >> 8);`
 	select {
 	case waitErr = <-done:
 	case <-ctx.Done():
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Cancellation ends the invocation the same way completion does: the group
+		// this scheduler started is signalled once and then proven absent from the
+		// process table before the call returns, so an abandoned verifier cannot
+		// leave descendants writing into the worktree. terminateVerifierProcessGroup
+		// is deliberately not called here, because it would signal the same group a
+		// second time.
+		reason := ctx.Err()
+		var cleanupErr error
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			cleanupErr = fmt.Errorf("kill verifier process group %d: %w", cmd.Process.Pid, err)
+		}
 		<-done
-		return -1, "", ctx.Err()
+		if err := waitVerifierProcessGroupGone(cmd.Process.Pid); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+		if cleanupErr != nil {
+			// The cancellation reason is carried alongside the cleanup failure: what
+			// ended the verifier and what could not be proven about it afterwards are
+			// both part of the receipt-protocol outcome. Nothing is published.
+			return -1, "", fmt.Errorf("%w: cancelled verifier was not proven gone: %w", errVerifierReceiptProtocol, errors.Join(reason, cleanupErr))
+		}
+		return -1, "", reason
 	}
 	// A verifier may be unrestricted, so its own exit proves nothing about the
 	// descendants it left behind. The group it owns is killed and proven gone
@@ -1336,21 +1355,9 @@ exit($status >> 8);`
 // observed until no member of it remains. The signal is sent exactly once. A
 // second kill aimed at a group the kernel has already emptied would address
 // whatever new group inherits that number next, so the only thing this does
-// after the initial kill is look.
-//
-// Looking means reading the process table, not probing the group with signal
-// zero. A zero-signal probe answers with this process's permission to signal
-// the group rather than with the group's existence, and macOS answers EPERM for
-// a group whose last member the very same kill removed. An absence proof must
-// not read that as a survivor, so the question is asked of the table instead:
-// how many processes does the kernel currently list in this group that this
-// user owns. Ownership is part of the question because a group number reused by
-// another user is not a descendant of anything this scheduler started.
-//
-// The deadline is wall-clock and short. Timing out, a ps that fails, and a
-// table that does not parse are all errors, never an assumption that the group
-// died: absence is only ever concluded from a table that was read and
-// understood. This never touches workspace content.
+// after the initial kill is look. Cancellation sends its own single signal and
+// then looks through waitVerifierProcessGroupGone directly, for the same reason.
+// This never touches workspace content.
 func terminateVerifierProcessGroup(pgid int) error {
 	if pgid <= 1 {
 		return fmt.Errorf("refusing to signal verifier process group %d", pgid)
@@ -1358,6 +1365,24 @@ func terminateVerifierProcessGroup(pgid int) error {
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("kill verifier process group %d: %w", pgid, err)
 	}
+	return waitVerifierProcessGroupGone(pgid)
+}
+
+// waitVerifierProcessGroupGone is the looking, and looking means reading the
+// process table, not probing the group with signal zero. A zero-signal probe
+// answers with this process's permission to signal the group rather than with
+// the group's existence, and macOS answers EPERM for a group whose last member
+// the very same kill removed. An absence proof must not read that as a
+// survivor, so the question is asked of the table instead: how many processes
+// does the kernel currently list in this group that this user owns. Ownership
+// is part of the question because a group number reused by another user is not
+// a descendant of anything this scheduler started.
+//
+// The deadline is wall-clock and short. Timing out, a ps that fails, and a
+// table that does not parse are all errors, never an assumption that the group
+// died: absence is only ever concluded from a table that was read and
+// understood.
+func waitVerifierProcessGroupGone(pgid int) error {
 	deadline := time.Now().Add(verifierGroupKillLimit)
 	for {
 		members, err := countProcessGroupMembers(pgid)

@@ -2929,6 +2929,64 @@ func TestVerifierWaitsForBackgroundDescendantsBeforeReturning(t *testing.T) {
 	}
 }
 
+// A cancelled verifier ends through the same absence proof a completed one
+// does: the call may not return while a process the verifier started is still
+// listed, and nothing about the abandoned invocation is published.
+func TestCancelledVerifierProvesDescendantAbsenceBeforeReturning(t *testing.T) {
+	eng, state, _ := newTestEngine(t, true, "")
+	claim := "55555555555555555555555555555555"
+	receipt, err := state.VerifierReceiptPath(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.prepareVerifierReceipt(claim, receipt); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	// No path through this test may leave the long sleeper behind.
+	t.Cleanup(func() {
+		if pid, ok := recordedPID(pidPath); ok {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	// The verifier publishes the pid of a long background child and then outlives
+	// the context itself, so cancellation is what ends the invocation.
+	command := []string{"/bin/sh", "-c", "sleep 300 & printf '%d\\n' \"$!\" > " + shellQuote(pidPath) + "; sleep 300"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type verifierResult struct {
+		code   int
+		detail string
+		err    error
+	}
+	results := make(chan verifierResult, 1)
+	go func() {
+		code, detail, err := eng.runVerifierCommand(ctx, t.TempDir(), receipt, claim, command)
+		results <- verifierResult{code: code, detail: detail, err: err}
+	}()
+	// Cancelling only once the descendant exists makes the window this test is
+	// about deterministic rather than a race against process startup.
+	pid := waitForRecordedPID(t, pidPath)
+	cancel()
+	var got verifierResult
+	select {
+	case got = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("cancelled verifier never returned")
+	}
+	if !errors.Is(got.err, context.Canceled) || got.code != -1 {
+		t.Fatalf("code=%d detail=%q err=%v", got.code, got.detail, got.err)
+	}
+	if sameUserProcessListed(t, pid) {
+		t.Fatalf("cancelled verifier returned while background descendant %d was still listed", pid)
+	}
+	for _, path := range []string{receipt, receipt + ".output", receipt + ".tmp"} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cancelled verifier published %s: %v", path, err)
+		}
+	}
+}
+
 // sameUserProcessListed reports whether the process table still lists pid under
 // this user.
 func sameUserProcessListed(t *testing.T, pid int) bool {
