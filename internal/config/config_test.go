@@ -200,6 +200,89 @@ func TestPerRunDiskReserveBoundEndpointsAreAccepted(t *testing.T) {
 	}
 }
 
+func claudeYAML() string {
+	return `version: 1
+jobs:
+  - id: claude-drift
+    revision: 1
+    schedule:
+      kind: cron
+      expression: "0 9 * * 1"
+      timezone: Asia/Hong_Kong
+      catch_up_grace_minutes: 120
+    execution:
+      repository: /tmp/repo
+      workspace: worktree
+      harness: claude-code
+      model: claude-opus-5
+      thinking: high
+      permission_profile: read-only-no-network
+    prompt: Check documentation drift.
+    timeout_minutes: 30
+    overlap: forbid
+    limits:
+      max_runs_per_day: 1
+`
+}
+
+func TestModelAttestationOmittedPreservesSnapshotsAndBehavior(t *testing.T) {
+	cfg, err := Load(writeConfig(t, claudeYAML()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := cfg.Jobs[0]
+	if job.Execution.RequireModelAttestation != nil || job.Execution.RequiresModelAttestation() {
+		t.Fatalf("omitted require_model_attestation must default to false: %+v", job.Execution.RequireModelAttestation)
+	}
+	raw, _, err := job.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "require_model_attestation") {
+		t.Fatalf("omitted field must not alter the snapshot: %s", raw)
+	}
+}
+
+func TestModelAttestationAcceptsFullClaudeModelName(t *testing.T) {
+	body := strings.Replace(claudeYAML(), "      permission_profile: read-only-no-network", "      permission_profile: read-only-no-network\n      require_model_attestation: true", 1)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Jobs[0].Execution.RequiresModelAttestation() {
+		t.Fatalf("attestation flag not loaded: %+v", cfg.Jobs[0].Execution)
+	}
+	for _, model := range []string{"claude-sonnet-4-5", "claude-haiku-4-5-20251001"} {
+		variant := strings.Replace(body, "model: claude-opus-5", "model: "+model, 1)
+		if _, err := Load(writeConfig(t, variant)); err != nil {
+			t.Fatalf("model %s rejected: %v", model, err)
+		}
+	}
+}
+
+func TestModelAttestationRejectsDefaultAndAliases(t *testing.T) {
+	body := strings.Replace(claudeYAML(), "      permission_profile: read-only-no-network", "      permission_profile: read-only-no-network\n      require_model_attestation: true", 1)
+	for _, model := range []string{"harness-default", "opus", "sonnet", "fable", "haiku", "claude", "claude-", "gpt-5.6-sol", "Claude-Opus-5"} {
+		t.Run(model, func(t *testing.T) {
+			variant := strings.Replace(body, "model: claude-opus-5", "model: "+model, 1)
+			if _, err := Load(writeConfig(t, variant)); err == nil || !strings.Contains(err.Error(), "require_model_attestation") {
+				t.Fatalf("model %q: expected attestation rejection, got %v", model, err)
+			}
+		})
+	}
+}
+
+func TestModelAttestationIsRejectedForPi(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		t.Run(value, func(t *testing.T) {
+			body := strings.Replace(validYAML(), "      permission_profile: read-only-no-network", "      permission_profile: read-only-no-network\n      require_model_attestation: "+value, 1)
+			if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "require_model_attestation") {
+				t.Fatalf("pi job: expected field rejection, got %v", err)
+			}
+		})
+	}
+}
+
 func eventYAML() string {
 	return strings.Replace(validYAML(), "kind: cron\n      expression: \"0 9 * * 1\"", "kind: event", 1)
 }

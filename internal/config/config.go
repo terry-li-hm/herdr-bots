@@ -111,6 +111,11 @@ type Execution struct {
 	Model             string `yaml:"model" json:"model"`
 	Thinking          string `yaml:"thinking,omitempty" json:"thinking"`
 	PermissionProfile string `yaml:"permission_profile" json:"permission_profile"`
+	// RequireModelAttestation is the opt-in launch contract for Claude model
+	// attestation. A nil (omitted) value preserves existing snapshots and
+	// launches exactly. It is a pointer so an explicit setting is observable
+	// even when false, which lets validation reject its presence on Pi.
+	RequireModelAttestation *bool `yaml:"require_model_attestation,omitempty" json:"require_model_attestation,omitempty"`
 }
 
 type Verifier struct {
@@ -535,6 +540,21 @@ func (e Execution) validate(jobID string) error {
 	if e.Harness == HarnessClaudeCode && e.Provider != "" {
 		return fmt.Errorf("%s: claude-code execution does not accept provider", jobID)
 	}
+	if e.RequireModelAttestation != nil {
+		if e.Harness != HarnessClaudeCode {
+			return fmt.Errorf("%s: execution.require_model_attestation is only valid with the claude-code harness", jobID)
+		}
+		if *e.RequireModelAttestation {
+			switch {
+			case e.Model == "harness-default":
+				return fmt.Errorf("%s: execution.require_model_attestation requires an explicit full model name, not harness-default", jobID)
+			case modelAliases[e.Model]:
+				return fmt.Errorf("%s: execution.require_model_attestation rejects the model alias %q; name a full model beginning with claude-", jobID, e.Model)
+			case !strings.HasPrefix(e.Model, "claude-") || len(e.Model) <= len("claude-"):
+				return fmt.Errorf("%s: execution.require_model_attestation requires a full model name beginning with claude-", jobID)
+			}
+		}
+	}
 	allowedThinking := map[string]bool{
 		"off": true, "minimal": true, "low": true, "medium": true,
 		"high": true, "xhigh": true, "max": true,
@@ -549,6 +569,18 @@ func (e Execution) validate(jobID string) error {
 		return fmt.Errorf("%s: permission_profile must be %s or %s", jobID, PermissionReadOnly, PermissionRepoWrite)
 	}
 	return nil
+}
+
+// modelAliases are short Claude model aliases that do not identify exactly one
+// model, so they can never satisfy an attestation contract.
+var modelAliases = map[string]bool{
+	"opus": true, "sonnet": true, "fable": true, "haiku": true,
+}
+
+// RequiresModelAttestation reports whether this job opted into the attested
+// Claude launch contract. Omitted or false keeps the ordinary launch.
+func (e Execution) RequiresModelAttestation() bool {
+	return e.RequireModelAttestation != nil && *e.RequireModelAttestation
 }
 
 func ValidateEventID(id string) error {

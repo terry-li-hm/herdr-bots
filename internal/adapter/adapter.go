@@ -115,6 +115,12 @@ func LaunchFor(job config.Job) (Launch, error) {
 			args = append(args, "--model", job.Execution.Model)
 		}
 		args = append(args, "--effort", job.Execution.Thinking, "--safe-mode", "--no-chrome", "--no-session-persistence", "--strict-mcp-config")
+		// The attested launch contract requires a machine-readable result so a
+		// later slice can bind the outcome to the configured model. Ordinary
+		// Claude launches stay byte-for-byte unchanged.
+		if job.Execution.RequiresModelAttestation() {
+			args = append(args, "--output-format", "json")
+		}
 		switch profile {
 		case config.PermissionReadOnly:
 			args = append(args, "--permission-mode", "plan", "--tools", "Read,Glob,Grep")
