@@ -65,14 +65,14 @@ grep -q '^module github.com/terry-li-hm/herdr-bots$' "$root/go.mod" || \
     fail 'go.mod module must be github.com/terry-li-hm/herdr-bots'
 grep -q '^id = "terry.herdr-bots"$' "$root/herdr-plugin.toml" || \
     fail 'plugin id must be terry.herdr-bots'
-grep -q '^version = "0.2.0"$' "$root/herdr-plugin.toml" || \
-    fail 'plugin manifest version must be 0.2.0'
+grep -q '^version = "0.3.0"$' "$root/herdr-plugin.toml" || \
+    fail 'plugin manifest version must be 0.3.0'
 grep -q 'const Label = "com.terry.herdr-bots"' "$root/internal/service/launchd.go" || \
     fail 'launchd service label must be com.terry.herdr-bots'
 grep -q -- '-o bin/herdr-bots ./cmd/herdr-bots' "$root/Makefile" || \
     fail 'Makefile build target must produce bin/herdr-bots'
-grep -q '^## \[0.2.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
-    fail 'CHANGELOG.md must carry the dated 0.2.0 entry'
+grep -q '^## \[0.3.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG.md must carry the dated 0.3.0 entry'
 note 'module, CLI, plugin, and service identities agree'
 
 # 4. Examples ship disabled.
@@ -90,9 +90,9 @@ note "example jobs disabled ($job_count/$job_count)"
 # 4b. Corrected publication contracts.
 grep -q 'https://github.com/herdrdev/herdr' "$root/README.md" || \
     fail 'README must point the Herdr prerequisite at github.com/herdrdev/herdr'
-grep -q 'go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.2.0' "$root/README.md" || \
+grep -q 'go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.3.0' "$root/README.md" || \
     fail 'README must document the current pinned go install path for the shell CLI'
-grep -q 'herdr plugin install terry-li-hm/herdr-bots --ref v0.2.0' "$root/README.md" || \
+grep -q 'herdr plugin install terry-li-hm/herdr-bots --ref v0.3.0' "$root/README.md" || \
     fail 'README must document the current pinned plugin install ref'
 grep -q 'herdr plugin uninstall terry.herdr-bots' "$root/README.md" || \
     fail 'README must use the exact current uninstall command'
@@ -107,10 +107,14 @@ grep -q 'reported by Pi' "$root/AGENTS.md" || \
     fail 'AGENTS.md must state non-Claude routes are configured/reported by Pi'
 grep -q 'actual release date' "$root/docs/release.md" || \
     fail 'docs/release.md must require setting the actual release date before tag/release'
+grep -q '^## \[0.3.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must carry the dated current 0.3.0 section'
+grep -q '^\[0.3.0\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.3.0$' "$root/CHANGELOG.md" || \
+    fail 'CHANGELOG must carry the current 0.3.0 release link'
 grep -q '^## \[0.2.0\] - 2026-08-25$' "$root/CHANGELOG.md" || \
-    fail 'CHANGELOG must carry the dated current 0.2.0 section'
+    fail 'CHANGELOG must preserve the historical dated 0.2.0 section'
 grep -q '^\[0.2.0\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0$' "$root/CHANGELOG.md" || \
-    fail 'CHANGELOG must carry the current 0.2.0 release link'
+    fail 'CHANGELOG must preserve the historical 0.2.0 release link'
 grep -q '^## \[0.1.1\] - 2026-08-24$' "$root/CHANGELOG.md" || \
     fail 'CHANGELOG must preserve the historical dated 0.1.1 section'
 grep -q '^\[0.1.1\]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1$' "$root/CHANGELOG.md" || \

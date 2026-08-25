@@ -7,9 +7,9 @@ inbox. Claude runs stay native to Claude Code; non-Claude routes configured and
 reported by Pi stay native to Pi. launchd supervises the scheduler. Nothing
 runs, installs, or schedules merely because this code exists on disk.
 
-**Status: v0.2.0 macOS prerelease (preview).** The scheduler lifecycle and
+**Status: v0.3.0 macOS prerelease (preview).** The scheduler lifecycle and
 its safety contract are complete and tested, but the project is young and
-the surface will change. v0.2.0 is a prerelease intended for early macOS
+the surface will change. v0.3.0 is a prerelease intended for early macOS
 adopters; the versioned contracts may still move before a stable release.
 macOS is the only supported build, test, plugin, and managed-service target.
 The engine uses macOS-only atomic filesystem primitives and does not
@@ -31,7 +31,7 @@ currently compile on Linux.
 ### Herdr plugin (pane surface)
 
 ```bash
-herdr plugin install terry-li-hm/herdr-bots --ref v0.2.0
+herdr plugin install terry-li-hm/herdr-bots --ref v0.3.0
 ```
 
 The plugin install provides the pane surface: the read-oriented run inbox.
@@ -68,7 +68,7 @@ rest) and the launchd service are not provided by the plugin install;
 install the CLI binary separately:
 
 ```bash
-go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.2.0
+go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.3.0
 ```
 
 Put the directory `go install` writes to on `PATH`. Find it with `go env

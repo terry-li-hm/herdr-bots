@@ -4,10 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
-## [Unreleased]
+## [0.3.0] - 2026-08-25
+
+macOS prerelease (preview): adds opt-in model attestation, bounded review
+inputs and observed write scope, and explicit acceptance lanes for terminal
+review. Existing v0.1.x and v0.2.0 configs remain valid, the new blocks are
+all opt-in, and the database migration is additive.
 
 ### Added
 
+- Explicit acceptance lanes for terminal review: `acceptance.mode` accepts
+  `mandatory`, `auto`, or `sample`, where `auto` and `sample` require a
+  verifier and `sample_percent` (1-100) is valid only for `sample`. Sampling is
+  deterministic from a SHA-256 bucket of the immutable run ID, so concurrent
+  processes classify the same run identically. Each terminal run records a
+  durable lane and machine reason alongside the verifier verdict; auto-reviewed
+  runs start read while sampled and mandatory runs start unread. Classification
+  is decided inside the serialized terminal transition, so it is written once
+  and survives restart and recovery without reclassifying an already-settled
+  run, and grants no further authority. Omitting the `acceptance` block keeps
+  snapshots byte-stable and defaults terminal review to `mandatory` without
+  changing the saved revision.
 - Opt-in `execution.require_model_attestation` for `claude-code` jobs. The
   attested launch asks the harness for a machine-readable result and, after the
   command completes and before the verifier runs, binds that result to the
@@ -34,6 +51,18 @@ versions with a `vMAJOR.MINOR.PATCH` prefix.
   the run as `bounded_review_failed`. The verdict is post-run evidence under
   shell-free permission profiles, not OS containment. Snapshots are retained in
   the evidence worktree; the scheduler never deletes them.
+
+### Fixed
+
+- Verifier process-group quiescence: the supervisor now proves the verifier's
+  process group has actually gone before the run settles, instead of assuming
+  termination once the command returns. Before signaling, the supervisor
+  observes the group's members and their ownership: a group with zero observed
+  members is skipped and treated as the success it is, and a signal is sent at
+  most once, only when same-user members are observed. `EPERM` and `ESRCH` are
+  resolved by re-observing membership rather than assumed, and the run fails
+  closed if members it owns — or any same-user member — remain. Absence is
+  proved before the run settles.
 
 ## [0.2.0] - 2026-08-25
 
@@ -107,6 +136,7 @@ Derived implementation patterns from the MIT-licensed
 `DnzzL/herdr-automations` project at commit `08640f3` by Thomas Legrand;
 this implementation is separately maintained by Terry Li. See `NOTICE`.
 
+[0.3.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.3.0
 [0.2.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0
 [0.1.1]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1
 [0.1.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.0

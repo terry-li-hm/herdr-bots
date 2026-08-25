@@ -127,6 +127,8 @@ func TestReleaseVersionContractsNameCurrentRelease(t *testing.T) {
 	}
 	changelog := read("CHANGELOG.md")
 	for _, want := range []string{
+		"## [0.3.0] - 2026-08-25\n",
+		"[0.3.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.3.0",
 		"## [0.2.0] - 2026-08-25\n",
 		"[0.2.0]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.2.0",
 		"[0.1.1]: https://github.com/terry-li-hm/herdr-bots/releases/tag/v0.1.1",
@@ -138,8 +140,8 @@ func TestReleaseVersionContractsNameCurrentRelease(t *testing.T) {
 	}
 	readme := read("README.md")
 	for _, want := range []string{
-		"herdr plugin install terry-li-hm/herdr-bots --ref v0.2.0",
-		"go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.2.0",
+		"herdr plugin install terry-li-hm/herdr-bots --ref v0.3.0",
+		"go install github.com/terry-li-hm/herdr-bots/cmd/herdr-bots@v0.3.0",
 	} {
 		if !strings.Contains(readme, want) {
 			t.Fatalf("README missing current install contract %q", want)
@@ -156,7 +158,7 @@ func TestReleaseManifestPointsAtSourceLauncher(t *testing.T) {
 	manifest := string(raw)
 	for _, want := range []string{
 		`id = "terry.herdr-bots"`,
-		`version = "0.2.0"`,
+		`version = "0.3.0"`,
 		`command = ["./herdr-bots", "pane"]`,
 	} {
 		if !strings.Contains(manifest, want) {
