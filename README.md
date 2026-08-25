@@ -255,6 +255,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.terry.herdr-bots.pli
 
 To stop later: `launchctl bootout gui/$(id -u)/com.terry.herdr-bots`.
 
+### Shared state with the plugin pane
+
+The managed plugin inbox invokes `herdr-bots pane` without `--state`, so it
+always reads the default state path,
+`~/.local/state/herdr-bots/state.sqlite3`. A launchd service intended to
+share that inbox must therefore also use the default state path — the plain
+`herdr-bots service render` output does this. A service rendered with a
+custom `--state` still runs against that custom database, but its runs will
+not appear in the managed plugin inbox. Users can invoke
+`herdr-bots pane --state PATH` manually for that database; this is not the
+managed plugin entrypoint.
+
 ## Build and development
 
 ```bash

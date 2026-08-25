@@ -72,6 +72,26 @@ func TestDefaultPathsUsePublicIdentity(t *testing.T) {
 	}
 }
 
+// TestServiceRenderDefaultsSharePaneState pins the durable contract that a
+// no-flag `service render` carries exactly the default config and state
+// paths used by no-flag CLI/pane operation, keeping one state authority.
+func TestServiceRenderDefaultsSharePaneState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("HERDR_BOTS_CONFIG", "")
+	t.Setenv("HERDR_BOTS_STATE", "")
+	text := captureStdout(t, func() {
+		if err := serviceCmd([]string{"render"}); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, want := range []string{defaultConfigPath(), defaultStatePath()} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("no-flag service render missing default path %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestServiceRenderUsesPublicLabelAndLogPath(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "bots.yaml")
