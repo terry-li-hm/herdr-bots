@@ -58,6 +58,22 @@ const (
 	AcceptanceSample    = "sample"
 )
 
+const (
+	// MaxBoundedInputs and MaxAllowedWritePaths bound the declared surface of a
+	// run: what it may read from outside the workspace, and what it may write
+	// inside the repository. Both limits are deliberately small, because the
+	// value of a declared bound is that an operator can read the whole list in
+	// the job definition and know what the run can touch.
+	MaxBoundedInputs     = 32
+	MaxAllowedWritePaths = 64
+
+	// BoundedInputsDir is the reserved, repository-relative directory that staged
+	// input snapshots are copied into. Every input destination lives strictly
+	// under it, and no write scope may name it or anything beneath it, so a run
+	// can never rewrite the very snapshots it was given as immutable input.
+	BoundedInputsDir = ".herdr-bots/inputs"
+)
+
 type Config struct {
 	Version  int      `yaml:"version" json:"version"`
 	Capacity Capacity `yaml:"capacity,omitempty" json:"capacity"`
@@ -116,6 +132,24 @@ type Execution struct {
 	// launches exactly. It is a pointer so an explicit setting is observable
 	// even when false, which lets validation reject its presence on Pi.
 	RequireModelAttestation *bool `yaml:"require_model_attestation,omitempty" json:"require_model_attestation,omitempty"`
+	// Inputs declares the immutable snapshots staged into the workspace before
+	// the run starts. An omitted list is the historical behavior exactly: it is
+	// absent from the job snapshot, so revisions of existing jobs do not change.
+	Inputs []InputSnapshot `yaml:"inputs,omitempty" json:"inputs,omitempty"`
+	// AllowedWritePaths narrows where a repo-write run may write. An omitted
+	// list preserves existing snapshots and the existing profile-wide scope; it
+	// is not an empty allowlist.
+	AllowedWritePaths []string `yaml:"allowed_write_paths,omitempty" json:"allowed_write_paths,omitempty"`
+}
+
+// InputSnapshot names one file to copy into the workspace before a run begins.
+// Source is an absolute path on this machine, optionally dated through the
+// supported placeholders; Destination is where the copy appears, always under
+// the reserved BoundedInputsDir so the run reads a snapshot rather than a live
+// path it could follow back out of the workspace.
+type InputSnapshot struct {
+	Source      string `yaml:"source" json:"source"`
+	Destination string `yaml:"destination" json:"destination"`
 }
 
 type Verifier struct {
@@ -568,8 +602,168 @@ func (e Execution) validate(jobID string) error {
 	if e.PermissionProfile != PermissionReadOnly && e.PermissionProfile != PermissionRepoWrite {
 		return fmt.Errorf("%s: permission_profile must be %s or %s", jobID, PermissionReadOnly, PermissionRepoWrite)
 	}
+	if err := e.validateInputs(jobID); err != nil {
+		return err
+	}
+	if err := e.validateAllowedWritePaths(jobID); err != nil {
+		return err
+	}
 	return nil
 }
+
+// inputPlaceholderSamples are the only placeholders an input source may use,
+// paired with a representative expansion. Validation expands the samples so a
+// dated source is judged as the path it will actually name, and so a source
+// that only looks absolute or only looks traversal-free before expansion is
+// still rejected.
+var inputPlaceholderSamples = map[string]string{
+	"{date}":  "2026-01-02",
+	"{year}":  "2026",
+	"{month}": "01",
+}
+
+// expandInputSamples substitutes the supported placeholders and then refuses
+// any remaining brace. Checking for braces after substitution rejects unknown
+// placeholders such as {week}, unbalanced braces, and nested constructions in
+// one pass, so nothing unexpanded can survive into a filesystem path.
+func expandInputSamples(source string) (string, bool) {
+	expanded := source
+	for token, sample := range inputPlaceholderSamples {
+		expanded = strings.ReplaceAll(expanded, token, sample)
+	}
+	if strings.ContainsAny(expanded, "{}") {
+		return "", false
+	}
+	return expanded, true
+}
+
+func hasTraversalSegment(path string) bool {
+	for _, segment := range strings.Split(path, string(filepath.Separator)) {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func (e Execution) validateInputs(jobID string) error {
+	if len(e.Inputs) > MaxBoundedInputs {
+		return fmt.Errorf("%s: execution.inputs allows at most %d entries, got %d", jobID, MaxBoundedInputs, len(e.Inputs))
+	}
+	sources := make(map[string]struct{}, len(e.Inputs))
+	destinations := make(map[string]struct{}, len(e.Inputs))
+	for i, input := range e.Inputs {
+		switch {
+		case input.Source == "":
+			return fmt.Errorf("%s: execution.inputs[%d].source must not be empty", jobID, i)
+		case strings.ContainsRune(input.Source, 0):
+			return fmt.Errorf("%s: execution.inputs[%d].source must not contain NUL", jobID, i)
+		}
+		expanded, ok := expandInputSamples(input.Source)
+		if !ok {
+			return fmt.Errorf("%s: execution.inputs[%d].source may only use the placeholders {date}, {year}, and {month}", jobID, i)
+		}
+		if !filepath.IsAbs(expanded) {
+			return fmt.Errorf("%s: execution.inputs[%d].source must be an absolute path once placeholders are expanded", jobID, i)
+		}
+		if hasTraversalSegment(expanded) {
+			return fmt.Errorf("%s: execution.inputs[%d].source must not contain .. once placeholders are expanded", jobID, i)
+		}
+
+		destination := input.Destination
+		switch {
+		case destination == "":
+			return fmt.Errorf("%s: execution.inputs[%d].destination must not be empty", jobID, i)
+		case strings.ContainsRune(destination, 0):
+			return fmt.Errorf("%s: execution.inputs[%d].destination must not contain NUL", jobID, i)
+		case strings.ContainsAny(destination, "{}"):
+			return fmt.Errorf("%s: execution.inputs[%d].destination must not use placeholders; only the source may be dated", jobID, i)
+		case filepath.IsAbs(destination):
+			return fmt.Errorf("%s: execution.inputs[%d].destination must be relative to the repository", jobID, i)
+		case hasTraversalSegment(destination):
+			return fmt.Errorf("%s: execution.inputs[%d].destination must not contain ..", jobID, i)
+		case filepath.Clean(destination) != destination:
+			return fmt.Errorf("%s: execution.inputs[%d].destination must be a clean relative path", jobID, i)
+		case destination == BoundedInputsDir:
+			return fmt.Errorf("%s: execution.inputs[%d].destination must name a path under %s/, not the directory itself", jobID, i, BoundedInputsDir)
+		case !strings.HasPrefix(destination, BoundedInputsDir+"/"):
+			return fmt.Errorf("%s: execution.inputs[%d].destination must be under %s/", jobID, i, BoundedInputsDir)
+		}
+
+		// Duplicate sources or destinations are rejected on the declared text.
+		// Two entries writing one destination make the staged content depend on
+		// copy order, and one source staged twice hides which copy a prompt
+		// means, so both are configuration mistakes rather than a merge.
+		if _, ok := sources[input.Source]; ok {
+			return fmt.Errorf("%s: execution.inputs has duplicate source %q", jobID, input.Source)
+		}
+		if _, ok := destinations[destination]; ok {
+			return fmt.Errorf("%s: execution.inputs has duplicate destination %q", jobID, destination)
+		}
+		sources[input.Source] = struct{}{}
+		destinations[destination] = struct{}{}
+	}
+	return nil
+}
+
+func (e Execution) validateAllowedWritePaths(jobID string) error {
+	if len(e.AllowedWritePaths) == 0 {
+		return nil
+	}
+	if e.PermissionProfile != PermissionRepoWrite {
+		return fmt.Errorf("%s: execution.allowed_write_paths is only valid with the %s permission profile", jobID, PermissionRepoWrite)
+	}
+	if len(e.AllowedWritePaths) > MaxAllowedWritePaths {
+		return fmt.Errorf("%s: execution.allowed_write_paths allows at most %d entries, got %d", jobID, MaxAllowedWritePaths, len(e.AllowedWritePaths))
+	}
+	for i, entry := range e.AllowedWritePaths {
+		switch {
+		case entry == "":
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not be empty", jobID, i)
+		case strings.ContainsRune(entry, 0):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not contain NUL", jobID, i)
+		// A wildcard is never expanded here, so an entry containing one would be
+		// matched literally and silently grant less, or be expanded by some later
+		// reader and silently grant more. Only exact paths and directory prefixes
+		// are expressible.
+		case strings.ContainsAny(entry, "*?["):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not contain the wildcard characters *, ?, or [", jobID, i)
+		case filepath.IsAbs(entry):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must be relative to the repository", jobID, i)
+		}
+
+		// A trailing slash is the explicit spelling of "this directory and its
+		// descendants"; without it the entry grants exactly one path.
+		isPrefix := strings.HasSuffix(entry, "/")
+		path := strings.TrimSuffix(entry, "/")
+		switch {
+		case path == "" || path == ".":
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must name a path, not the repository root", jobID, i)
+		case hasTraversalSegment(path):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not contain ..", jobID, i)
+		case filepath.Clean(path) != path:
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must be a clean relative path", jobID, i)
+		case path == ".git" || strings.HasPrefix(path, ".git/"):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not grant writes to .git", jobID, i)
+		case path == BoundedInputsDir || strings.HasPrefix(path, BoundedInputsDir+"/"):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] must not grant writes to %s, which holds immutable staged inputs", jobID, i, BoundedInputsDir)
+		// A directory prefix above the reserved inputs directory would grant the
+		// writes the previous case refuses, just spelled from an ancestor.
+		case isPrefix && strings.HasPrefix(BoundedInputsDir+"/", path+"/"):
+			return fmt.Errorf("%s: execution.allowed_write_paths[%d] is a directory prefix containing %s, which holds immutable staged inputs", jobID, i, BoundedInputsDir)
+		}
+	}
+	return nil
+}
+
+// HasBoundedInputs reports whether the job declares input snapshots to stage
+// before the run. Omitted means no staging, exactly as before the field existed.
+func (e Execution) HasBoundedInputs() bool { return len(e.Inputs) > 0 }
+
+// HasWriteScope reports whether the job narrowed its writes to a declared set
+// of paths. Omitted means the permission profile alone decides, so callers must
+// not read a false here as "writes are forbidden".
+func (e Execution) HasWriteScope() bool { return len(e.AllowedWritePaths) > 0 }
 
 // modelAliases are short Claude model aliases that do not identify exactly one
 // model, so they can never satisfy an attestation contract.
