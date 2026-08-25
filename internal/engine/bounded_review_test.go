@@ -525,6 +525,50 @@ func TestVerifyBoundedReviewFailsWhenStagedInputNoLongerMatchesItsReceipt(t *tes
 	}
 }
 
+// A staged input rewritten in place while it is being verified must not pass
+// verification, and must be named as the rewrite it is. The rewrite keeps the
+// inode and the length, so nothing but the timestamps says it happened, and it
+// is driven from the verification itself rather than from a competing goroutine:
+// the window is hit exactly once, every time, with no sleeping.
+func TestVerifyBoundedReviewRefusesAStagedInputRewrittenDuringVerification(t *testing.T) {
+	const rewritten = "region,count\nhk,43\n"
+	if len(rewritten) != len(boundedTestContent) {
+		t.Fatalf("the rewrite is %d bytes and the staged input is %d: the length must not change", len(rewritten), len(boundedTestContent))
+	}
+	f := newBoundedFixture(t, []string{"reports/"}).stage(t)
+
+	rewrites := 0
+	boundedVerifyInputRace = func(destination string) {
+		if destination != boundedTestDestination {
+			return
+		}
+		rewrites++
+		writeBoundedFile(t, f.staged(), rewritten)
+		bumpBoundedModTime(t, f.staged())
+	}
+	defer func() { boundedVerifyInputRace = nil }()
+
+	payload, err := f.engine.verifyBoundedReview(context.Background(), f.run, f.job)
+	if rewrites != 1 {
+		t.Fatalf("the verification window was entered %d times, want exactly 1", rewrites)
+	}
+	if err == nil || !strings.Contains(err.Error(), "staged input was rewritten while it was being verified") {
+		t.Fatalf("err=%v want it to name the rewrite", err)
+	}
+	if !strings.Contains(err.Error(), boundedTestDestination) {
+		t.Fatalf("err=%v want it to name %q", err, boundedTestDestination)
+	}
+	if payload != "" {
+		t.Fatalf("refused verification returned receipt %q", payload)
+	}
+	if _, stored := boundedStoredReceipts(t, f.store, f.run.ID); stored != "" {
+		t.Fatalf("refused verification persisted change receipt %q", stored)
+	}
+	// A refusal is not a cleanup: the rewritten bytes stay on disk as the
+	// evidence of what the run did to its own snapshot.
+	assertBoundedContent(t, f.staged(), rewritten)
+}
+
 func TestVerifyBoundedReviewRefusesUndeclaredFileUnderReservedInputs(t *testing.T) {
 	f := newBoundedFixture(t, []string{"reports/"}).stage(t)
 	planted := filepath.Join(f.repo, config.BoundedInputsDir, "extra.csv")

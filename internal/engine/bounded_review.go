@@ -453,6 +453,13 @@ func verifyStagedInputs(root, receipt string) ([]string, error) {
 	return out, nil
 }
 
+// boundedVerifyInputRace is nil in production. Like boundedObserveRace it exists
+// so a test can open the window the identity checks below are about: it is
+// called once per staged input, after that input's descriptor has been proven to
+// be the file the directory entry named and before its content is read, which is
+// exactly where a concurrent writer would land.
+var boundedVerifyInputRace func(destination string)
+
 func verifyOneStagedInput(root string, file boundedInputFile) error {
 	parentFD, err := openReservedParents(root, filepath.Dir(file.Destination), false)
 	if err != nil {
@@ -489,15 +496,32 @@ func verifyOneStagedInput(root string, file boundedInputFile) error {
 	if err := unix.Fstat(fd, &opened); err != nil {
 		return fmt.Errorf("bounded review: stage=verify-input path=%s: %w", file.Destination, err)
 	}
-	if !boundedIsRegular(opened) || opened.Dev != named.Dev || opened.Ino != named.Ino || opened.Size != named.Size {
+	if !boundedSameStatIdentity(named, opened) {
 		return fmt.Errorf("bounded review: stage=verify-input path=%s: staged input changed while it was being opened", file.Destination)
+	}
+	if boundedVerifyInputRace != nil {
+		boundedVerifyInputRace(file.Destination)
 	}
 	hasher := sha256.New()
 	read, err := io.Copy(hasher, io.LimitReader(handle, file.Size+1))
 	if err != nil {
 		return fmt.Errorf("bounded review: stage=verify-input path=%s: %w", file.Destination, err)
 	}
-	if read != file.Size || hex.EncodeToString(hasher.Sum(nil)) != file.SHA256 {
+	matchesReceipt := read == file.Size && hex.EncodeToString(hasher.Sum(nil)) == file.SHA256
+	// The digest is only trusted once the descriptor is proven to have held the
+	// same file, in the same state, for the whole read. A rewrite in place keeps
+	// the inode and can keep the length, so this is the check that sees it at
+	// all. It is reported ahead of a digest mismatch because it explains one: a
+	// snapshot that moved while it was being read was never a stable thing to
+	// compare against the receipt in the first place.
+	var settled unix.Stat_t
+	if err := unix.Fstat(fd, &settled); err != nil {
+		return fmt.Errorf("bounded review: stage=verify-input path=%s: %w", file.Destination, err)
+	}
+	if !boundedSameStatIdentity(opened, settled) {
+		return fmt.Errorf("bounded review: stage=verify-input path=%s: staged input was rewritten while it was being verified", file.Destination)
+	}
+	if !matchesReceipt {
 		return fmt.Errorf("bounded review: stage=verify-input path=%s: staged input no longer matches its receipt", file.Destination)
 	}
 	return nil
