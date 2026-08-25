@@ -51,14 +51,23 @@ func TestProbePiRequiresObservedExactRoute(t *testing.T) {
 	}
 }
 
-func TestPiReadOnlyLaunchHasNoShellOrWriteTools(t *testing.T) {
+func TestPiReadOnlyLaunchIsHeadlessCommandWithoutShellOrWriteTools(t *testing.T) {
 	got, err := LaunchFor(piJob())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"--provider", "openai-codex", "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--model", "gpt-5.6-sol", "--thinking", "high", "--tools", "read,grep,find,ls"}
-	if got.Mode != ModeAgent || got.Kind != "pi" || !reflect.DeepEqual(got.Args, want) {
-		t.Fatalf("got %+v want %v", got, want)
+	// A scheduled Pi job runs as a headless command in its Herdr workspace, so
+	// the command exits and leaves no live Pi process counted as an attended
+	// session. The
+	// engine's command line supplies `-p`; the adapter must not duplicate it.
+	if got.Mode != ModeCommand || got.Kind != "pi" || !reflect.DeepEqual(got.Args, want) {
+		t.Fatalf("got %+v want mode=%q kind=pi args=%v", got, ModeCommand, want)
+	}
+	for _, arg := range got.Args {
+		if arg == "-p" || arg == "--no-session" {
+			t.Fatalf("adapter must not add %q: %v", arg, got.Args)
+		}
 	}
 }
 
@@ -118,7 +127,7 @@ func TestPiLaunchIsUnchangedEvenWithAttestationFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"--provider", "openai-codex", "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--model", "gpt-5.6-sol", "--thinking", "high", "--tools", "read,grep,find,ls"}
-	if got.Mode != ModeAgent || got.Kind != "pi" || !reflect.DeepEqual(got.Args, want) {
+	if got.Mode != ModeCommand || got.Kind != "pi" || !reflect.DeepEqual(got.Args, want) {
 		t.Fatalf("pi argv changed by attestation flag: got %+v want %v", got, want)
 	}
 }

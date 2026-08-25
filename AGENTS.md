@@ -2,8 +2,9 @@
 
 Herdr Bots is a local, current-user control plane for scheduled coding-agent
 work. Claude models route through Claude Code. Non-Claude routes are
-configured and reported by Pi. This document records repository conventions
-for coding agents working here.
+configured and reported by Pi. Scheduled Pi and Claude jobs are headless
+commands in Herdr, while Herdr remains the visible review surface. This
+document records repository conventions for coding agents working here.
 
 ## Architecture
 
@@ -18,7 +19,7 @@ config validation -> scheduler -> SQLite occurrence/run state
                            |
                            v
                     Herdr worktree + native harness
-                    Pi agent | Claude headless command
+                    Pi headless command | Claude headless command
                            |
                            v
                     optional deterministic verifier
@@ -86,9 +87,16 @@ When adding a lifecycle feature:
 - `catch_up_grace_minutes: 0` still allows normal polling skew of 60 seconds.
 - Pi is treated as a harness, not a generic model API. Provider and model are
   checked against Pi before workspace creation.
-- Claude runs as `claude -p --safe-mode` in the Herdr pane. Interactive
-  Claude stops at a trust prompt for every fresh worktree, while print mode
-  keeps the native subscription route and `--tools` availability boundary.
+- Scheduled Pi and Claude jobs both run as headless commands (`pi -p`,
+  `claude -p --safe-mode`) in the Herdr workspace. Neither leaves a live
+  agent process behind: the headless command exits, so it does not
+  contribute to the process-based attended-session count (Herdr's screen
+  detector may briefly retain a stale Pi label while the pane foreground is
+  the shell). Herdr remains the visible review surface for command output,
+  the run worktree, and the inbox. Completed workspaces may remain
+  shell-only;
+  nothing here closes or deletes them. Legacy agent-mode receipts from runs
+  started before this change still reconcile.
 - The no-network profiles enforce their boundary by omitting shell and web
   tools. Adding Bash or another shell invalidates that claim.
 - `observed_within_scope` is a post-run observation of the worktree, not

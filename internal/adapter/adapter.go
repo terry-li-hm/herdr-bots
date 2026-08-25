@@ -112,7 +112,13 @@ func LaunchFor(job config.Job) (Launch, error) {
 		default:
 			return Launch{}, fmt.Errorf("unsupported permission profile %q", profile)
 		}
-		return Launch{Mode: ModeAgent, Kind: "pi", Args: args}, nil
+		// Scheduled Pi jobs run as headless commands in the existing Herdr
+		// workspace: the engine's command line already supplies `-p` for every
+		// command-mode launch, so the headless Pi command exits and leaves no
+		// live Pi process contributing to the process-based attended-session
+		// count. Args are unchanged, so the provider, model,
+		// thinking, tool, and session boundaries stay exactly as before.
+		return Launch{Mode: ModeCommand, Kind: "pi", Args: args}, nil
 	case config.HarnessClaudeCode:
 		args := []string{}
 		if job.Execution.Model != "harness-default" {

@@ -80,7 +80,9 @@ type fakeHerdr struct {
 	submitCount      int
 	submitErr        error
 	// submitMutation stands in for what the agent does to the workspace once it
-	// has the prompt. It runs outside the mutex so it may inspect this fake.
+	// has the prompt. The fake now runs it from StartCommand, because every
+	// harness launches as a headless command; it runs outside the mutex so it
+	// may inspect this fake.
 	submitMutation    func()
 	statusCount       int
 	closeCount        int
@@ -231,14 +233,69 @@ func (f *fakeHerdr) Status(context.Context, string) (string, error) {
 	}
 	return status, nil
 }
-func (f *fakeHerdr) StartCommand(_ context.Context, _ string, command string) error {
+
+// promptPathFromCommand recovers the stdin redirection target the engine
+// embedded in the launched command line, so the fake can observe the exact
+// prompt bytes a headless harness would read from stdin.
+func promptPathFromCommand(command string) string {
+	at := strings.Index(command, "< '")
+	if at < 0 {
+		return ""
+	}
+	rest := command[at+len("< '"):]
+	end := strings.Index(rest, "'")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+func (f *fakeHerdr) StartCommand(ctx context.Context, _ string, command string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.command = command
+	started, gate, mutate := f.submitStarted, f.submitGate, f.submitMutation
+	f.mu.Unlock()
+	// A headless launch reads its prompt from the redirected stdin file, so
+	// observing that file is how the fake captures the prompt.
+	if path := promptPathFromCommand(command); path != "" {
+		if body, err := os.ReadFile(path); err == nil {
+			f.mu.Lock()
+			f.prompt = string(body)
+			f.mu.Unlock()
+		}
+	}
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if mutate != nil {
+		mutate()
+	}
 	return nil
 }
-func (f *fakeHerdr) WaitCommand(context.Context, string, string, time.Duration) (int, error) {
-	return f.commandCode, f.commandErr
+func (f *fakeHerdr) WaitCommand(ctx context.Context, _, _ string, _ time.Duration) (int, error) {
+	if f.commandErr != nil {
+		return f.commandCode, f.commandErr
+	}
+	// waitCh is the same gate the agent-mode Wait honored: while it is open the
+	// command has not finished, so a run under it stays running.
+	if f.waitCh != nil {
+		select {
+		case <-f.waitCh:
+		case <-ctx.Done():
+			return f.commandCode, ctx.Err()
+		}
+	}
+	return f.commandCode, nil
 }
 func (f *fakeHerdr) CommandResult(context.Context, string, string) (int, bool, error) {
 	return f.commandCode, true, nil
@@ -371,13 +428,27 @@ func TestEvaluateRunsOneVerifiedOccurrence(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.provisions != 1 || client.kind != "pi" {
-		t.Fatalf("client=%+v", client)
+	if client.provisions != 1 || client.startAgentCount != 0 || client.submitCount != 0 {
+		t.Fatalf("pi must launch as a headless command, not an agent: client=%+v", client)
 	}
-	for _, arg := range client.args {
-		if arg == "bash" || arg == "read,grep,find,ls,edit,write" {
-			t.Fatalf("read-only route exposed write or shell: %v", client.args)
+	// The command must carry the quoted harness invocation, the exact route
+	// flags, the redirected stdin prompt, and the completion marker the engine
+	// reconciles on.
+	for _, required := range []string{
+		"'pi' -p",
+		"'--provider' 'openai-codex'",
+		"'--model' 'gpt-5.6-sol'",
+		"'--thinking' 'high'",
+		"'--tools' 'read,grep,find,ls'",
+		"< '",
+		"HERDR_BOTS_RUN_",
+	} {
+		if !strings.Contains(client.command, required) {
+			t.Fatalf("command %q missing %q", client.command, required)
 		}
+	}
+	if strings.Contains(client.command, "edit,write") || strings.Contains(client.command, "bash") {
+		t.Fatalf("read-only route exposed write or shell: %q", client.command)
 	}
 }
 
@@ -432,8 +503,8 @@ func TestAcceptedEventDispatchesOnceAfterRestart(t *testing.T) {
 	}
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if client.provisions != 1 || client.submitCount != 1 {
-		t.Fatalf("provisions=%d submits=%d", client.provisions, client.submitCount)
+	if client.provisions != 1 || client.submitCount != 0 || client.startAgentCount != 0 || !strings.Contains(client.command, "'pi' -p") {
+		t.Fatalf("provisions=%d submits=%d starts=%d command=%q", client.provisions, client.submitCount, client.startAgentCount, client.command)
 	}
 }
 
@@ -853,19 +924,47 @@ func TestRouteMismatchFailsBeforeProvisioning(t *testing.T) {
 	}
 }
 
-func TestBlockedAgentIsNotReportedAsSuccess(t *testing.T) {
+// A legacy ModeAgent receipt from a run started before headless command
+// launches must still reconcile to a blocked verdict when Herdr reports the
+// pane blocked; it must never be reported as success.
+func TestBlockedLegacyAgentReceiptIsNotReportedAsSuccess(t *testing.T) {
 	eng, state, client := newTestEngine(t, true, "provider model\nopenai-codex gpt-5.6-sol\n")
-	client.status = "blocked"
 	ctx := context.Background()
-	if err := eng.Evaluate(ctx, mustTime("2026-08-22T08:59:00+08:00")); err != nil {
+	cfg, err := config.Load(eng.ConfigPath)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:00:30+08:00")); err != nil {
+	snapshot, revision, err := cfg.Jobs[0].Snapshot()
+	if err != nil {
 		t.Fatal(err)
 	}
-	run := waitForTerminal(t, state, "docs-drift")
-	if run.State != store.StateBlocked || run.AgentResult != "blocked" || run.TaskVerdict != "unverified" {
-		t.Fatalf("run=%+v", run)
+	now := mustTime("2026-08-22T09:00:00+08:00")
+	if _, err := state.SyncJob(ctx, cfg.Jobs[0].ID, revision, snapshot, true, now); err != nil {
+		t.Fatal(err)
+	}
+	run, err := state.CreateManualRun(ctx, cfg.Jobs[0].ID, revision, snapshot, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Transition(ctx, run.ID, store.StateAccepted, store.StateProvisioning, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetReceipt(ctx, run.ID, "w-blocked", "p-blocked", "auto/test", client.path, adapter.ModeAgent, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Transition(ctx, run.ID, store.StateProvisioning, store.StateStarting, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Transition(ctx, run.ID, store.StateStarting, store.StateRunning, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	client.status = "blocked"
+	if err := eng.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := waitForTerminal(t, state, "docs-drift")
+	if got.State != store.StateBlocked || got.AgentResult != "blocked" || got.TaskVerdict != "unverified" {
+		t.Fatalf("run=%+v", got)
 	}
 }
 
@@ -1963,7 +2062,7 @@ jobs:
 	}
 }
 
-func TestCrossProcessReconcilePreservesReceiptToPromptWindow(t *testing.T) {
+func TestCrossProcessReconcilePreservesReceiptToCommandStartWindow(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	firstStore, err := store.Open(dbPath)
 	if err != nil {
@@ -2008,7 +2107,7 @@ func TestCrossProcessReconcilePreservesReceiptToPromptWindow(t *testing.T) {
 	select {
 	case <-submitStarted:
 	case <-time.After(3 * time.Second):
-		t.Fatal("prompt submission did not start")
+		t.Fatal("command start did not begin")
 	}
 	starting, err := secondStore.GetRun(ctx, run.ID)
 	if err != nil {
@@ -2018,7 +2117,7 @@ func TestCrossProcessReconcilePreservesReceiptToPromptWindow(t *testing.T) {
 		t.Fatalf("receipt-bearing start did not retain its live owner: %+v", starting)
 	}
 	// Herdr reports an idle pane, but the second engine must not interpret that
-	// as task completion while prompt acceptance is still pending.
+	// as task completion while the headless command's start is still pending.
 	if err := secondEngine.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -2029,7 +2128,7 @@ func TestCrossProcessReconcilePreservesReceiptToPromptWindow(t *testing.T) {
 	client.mu.Lock()
 	statusCalls, provisions, starts, submits := client.statusCount, client.provisions, client.startAgentCount, client.submitCount
 	client.mu.Unlock()
-	if stillStarting.State != store.StateStarting || stillStarting.ProvisioningOwner != firstEngine.owner || statusCalls != 0 || provisions != 1 || starts != 1 || submits != 1 {
+	if stillStarting.State != store.StateStarting || stillStarting.ProvisioningOwner != firstEngine.owner || statusCalls != 0 || provisions != 1 || starts != 0 || submits != 0 {
 		t.Fatalf("run=%+v status=%d provisions=%d starts=%d submits=%d", stillStarting, statusCalls, provisions, starts, submits)
 	}
 	close(submitGate)
@@ -3483,48 +3582,13 @@ func TestCrossProcessCancellationClosesWorkspaceOnce(t *testing.T) {
 	_ = second
 }
 
-func TestAmbiguousAgentStartWaitsForReconciliationWithoutDuplicateStart(t *testing.T) {
-	eng, state, client := newTestEngine(t, true, "provider model\nopenai-codex gpt-5.6-sol\n")
-	base := time.Now()
-	eng.Now = func() time.Time { return base }
-	client.startAgentErr = errors.New("start response lost")
-	ctx := context.Background()
-	if err := eng.Evaluate(ctx, mustTime("2026-08-22T08:59:00+08:00")); err != nil {
-		t.Fatal(err)
-	}
-	if err := eng.Evaluate(ctx, mustTime("2026-08-22T09:00:30+08:00")); err != nil {
-		t.Fatal(err)
-	}
-	var run store.Run
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		runs, err := state.ListRuns(ctx, "docs-drift", 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(runs) == 1 && !eng.InFlight(runs[0].ID) {
-			run = runs[0]
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if run.State != store.StateStarting || run.ErrorCode == "agent_start_failed" {
-		t.Fatalf("ambiguous start was terminalized: %+v", run)
-	}
-	client.startAgentErr = nil
-	eng.Now = func() time.Time { return base.Add(2 * time.Minute) }
-	if err := eng.Reconcile(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got := waitForRunTerminal(t, state, run.ID)
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	if got.State != store.StateInterrupted || client.startAgentCount != 1 || client.closeCount != 1 {
-		t.Fatalf("run=%+v starts=%d closes=%d", got, client.startAgentCount, client.closeCount)
-	}
-}
+// TestAmbiguousAgentStartWaitsForReconciliationWithoutDuplicateStart was
+// retired when scheduled Pi jobs moved to headless command launches: no live
+// harness reaches StartAgent anymore, so the ambiguous-start recovery it drove
+// is now covered by the synthetic legacy ModeAgent receipt tests below and by
+// TestCrossProcessExpiredStartingClaimInterruptsWithoutIdleInference.
 
-func TestConfirmStartingClaimFaultAfterSubmitSurfacesDurableEvidence(t *testing.T) {
+func TestConfirmStartingClaimFaultAfterCommandStartSurfacesDurableEvidence(t *testing.T) {
 	eng, state, client := newTestEngine(t, true, "provider model\nopenai-codex gpt-5.6-sol\n")
 	ctx := context.Background()
 	cfg, err := config.Load(eng.ConfigPath)
@@ -3583,10 +3647,11 @@ func TestConfirmStartingClaimFaultAfterSubmitSurfacesDurableEvidence(t *testing.
 	surfaced := eng.Dispatch(ctx)
 	recovered := eng.Dispatch(ctx)
 	client.mu.Lock()
-	starts, submits := client.startAgentCount, client.submitCount
+	starts, submits, provisions := client.startAgentCount, client.submitCount, client.provisions
+	command := client.command
 	client.mu.Unlock()
-	if starts != 1 || submits != 1 || got.State != store.StateStarting || !got.Unread || evidence.Code != "background_store_error" || !strings.Contains(evidence.Detail, injected.Error()) || surfaced == nil || !strings.Contains(surfaced.Error(), injected.Error()) || recovered != nil {
-		t.Fatalf("starts=%d submits=%d run=%+v evidence=%+v surfaced=%v recovered=%v", starts, submits, got, evidence, surfaced, recovered)
+	if starts != 0 || submits != 0 || provisions != 1 || !strings.Contains(command, "'pi' -p") || got.State != store.StateStarting || !got.Unread || evidence.Code != "background_store_error" || !strings.Contains(evidence.Detail, injected.Error()) || surfaced == nil || !strings.Contains(surfaced.Error(), injected.Error()) || recovered != nil {
+		t.Fatalf("starts=%d submits=%d provisions=%d run=%+v evidence=%+v surfaced=%v recovered=%v", starts, submits, provisions, got, evidence, surfaced, recovered)
 	}
 }
 

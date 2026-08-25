@@ -4,7 +4,16 @@ Herdr Bots runs scheduled coding-agent jobs on your Mac. A bot is a durable,
 versioned job charter; each of its runs is short-lived, executes in a fresh
 Herdr worktree on a pinned route, and lands in a read-oriented evidence
 inbox. Claude runs stay native to Claude Code; non-Claude routes configured and
-reported by Pi stay native to Pi. launchd supervises the scheduler. Nothing
+reported by Pi stay native to Pi. Every scheduled job — Pi or Claude Code
+alike — executes as a headless command (`pi -p`, `claude -p`) inside its
+existing Herdr workspace. The headless Pi command exits and leaves no live
+Pi process, so a finished automation does not contribute to the
+process-based attended-session count (Herdr's screen detector may briefly
+retain a stale Pi label while the pane foreground is the shell); Herdr stays
+the visible review surface for command
+output, the run worktree, and the inbox. Completed workspaces may remain
+behind as review surfaces; the scheduler does not close or delete them.
+launchd supervises the scheduler. Nothing
 runs, installs, or schedules merely because this code exists on disk.
 
 **Status: v0.3.0 macOS prerelease (preview).** The scheduler lifecycle and
@@ -425,6 +434,13 @@ above, and the worktrees listed in `herdr-bots runs`/`show` output yourself.
   headroom is exhausted. Per-run disk reserves are charged per filesystem
   device and persisted with each durable claim; active repositories are never
   probed from another run's admission.
+- Scheduled Pi and Claude jobs both launch as headless commands in their
+  Herdr workspace. The command's pane keeps its output visible and the run
+  worktree is untouched by this choice, so a completed automation's headless
+  command exits and leaves no live agent process behind; it does not
+  contribute to the process-based attended-session count. Workspaces are not
+  auto-closed or
+  deleted on this account.
 - No automatic agent retry. No automatic worktree deletion. No push, merge,
   message, or publication authority anywhere in the scheduler.
 - On restart: accepted runs dispatch once; live owned claims survive

@@ -56,6 +56,13 @@ acknowledgement; fixes ship through the normal release process described in
 
 ## Operational boundaries
 
+- Scheduled Pi and Claude jobs both launch as headless commands in their
+  Herdr workspace, so the headless command exits and leaves no live agent
+  process contributing to the process-based attended-session count.
+  Herdr's screen detector may briefly retain a stale Pi label even when the
+  pane foreground is the shell; label clearance is not immediate. Completed
+  workspaces remain shell-only review surfaces and are not auto-closed or
+  deleted.
 - Manual pause (global or per job), run cancellation, launchd service
   unload, and worktree cleanup are always available and never automated away.
 - The scheduler has no automatic retry, no automatic deletion, and no push,
