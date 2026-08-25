@@ -2195,6 +2195,9 @@ func (s *Store) FinishStartingClaim(ctx context.Context, id, owner, state, infra
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
 	if err != nil {
 		return false, err
@@ -2230,6 +2233,9 @@ func (s *Store) FinishProvisioningClaim(ctx context.Context, id, owner, state, i
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, state, verdict)
 	if err != nil {
 		return false, err
@@ -2261,6 +2267,9 @@ func (s *Store) InterruptExpiredProvisioning(ctx context.Context, id string, now
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, StateInterrupted, "unverified")
 	if err != nil {
 		return false, err
@@ -2293,6 +2302,9 @@ func (s *Store) InterruptExpiredStarting(ctx context.Context, id, code, detail s
 		return false, err
 	}
 	defer tx.Rollback()
+	if err := lockOccurrenceWrites(ctx, tx); err != nil {
+		return false, err
+	}
 	lane, reason, unread, err := terminalAcceptanceTx(ctx, tx, id, StateInterrupted, "unverified")
 	if err != nil {
 		return false, err

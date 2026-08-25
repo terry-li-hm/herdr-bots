@@ -91,6 +91,40 @@ func completeAfterHeldWrite(t *testing.T, held *sql.Tx, operation func() error) 
 	}
 }
 
+func assertLaterInboxOrdering(t *testing.T, first, second *Store, runID string, now time.Time) {
+	t.Helper()
+	if err := first.MarkRead(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	run, err := second.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Unread {
+		t.Fatalf("later mark-read was lost: %+v", run)
+	}
+	if err := second.RecordRunEvent(context.Background(), runID, "post_terminal_evidence", "later evidence", now); err != nil {
+		t.Fatal(err)
+	}
+	run, err = first.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Unread {
+		t.Fatalf("later event did not reopen unread: %+v", run)
+	}
+	if err := first.MarkRead(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	run, err = second.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Unread {
+		t.Fatalf("mark-read after the later event was lost: %+v", run)
+	}
+}
+
 func ts(value string) time.Time { return must(time.Parse(time.RFC3339, value)) }
 func must[T any](v T, err error) T {
 	if err != nil {
@@ -653,6 +687,109 @@ func TestAcceptanceWritesReserveBeforeReadsAcrossHandles(t *testing.T) {
 			t.Fatalf("later mark-read was lost after event: %+v", run)
 		}
 	})
+}
+
+func TestClaimAndRecoveryWritesReserveBeforeReadsAcrossHandles(t *testing.T) {
+	base := ts("2026-08-22T01:00:00Z")
+	owner := "claim-owner"
+	definition := snapshotDefinition(t, config.Job{ID: "job"})
+
+	provision := func(t *testing.T, state *Store, id string) Run {
+		t.Helper()
+		run, err := state.CreateManualRun(context.Background(), "job", "rev1", definition, base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admitted, err := state.DecideAdmission(context.Background(), run.ID, owner, "disk-1", 1, base, base.Add(time.Minute), func([]Run) (AdmissionDecision, error) {
+			return AdmissionDecision{Admit: true}, nil
+		})
+		if err != nil || !admitted {
+			t.Fatalf("run %s admitted=%t err=%v", id, admitted, err)
+		}
+		return run
+	}
+	start := func(t *testing.T, state *Store, id string) Run {
+		t.Helper()
+		run := provision(t, state, id)
+		saved, err := state.SaveProvisioningReceipt(context.Background(), run.ID, owner, "workspace-"+id, "pane-"+id, "branch-"+id, "/tmp/"+id, "agent", "", base.Add(10*time.Second))
+		if err != nil || !saved {
+			t.Fatalf("run %s receipt saved=%t err=%v", id, saved, err)
+		}
+		return run
+	}
+
+	cases := []struct {
+		name      string
+		prepare   func(*testing.T, *Store, string) Run
+		operation func(*Store, string) (bool, error)
+		wantState string
+		wantCode  string
+	}{
+		{
+			name:    "finish starting claim",
+			prepare: start,
+			operation: func(state *Store, id string) (bool, error) {
+				return state.FinishStartingClaim(context.Background(), id, owner, StateFailed, "failed", "not_started", "unverified", "start_failed", "start failed", base.Add(30*time.Second))
+			},
+			wantState: StateFailed,
+			wantCode:  "start_failed",
+		},
+		{
+			name:    "finish provisioning claim",
+			prepare: provision,
+			operation: func(state *Store, id string) (bool, error) {
+				return state.FinishProvisioningClaim(context.Background(), id, owner, StateFailed, "failed", "not_started", "unverified", "provision_failed", "provision failed", base.Add(30*time.Second))
+			},
+			wantState: StateFailed,
+			wantCode:  "provision_failed",
+		},
+		{
+			name:    "interrupt expired provisioning",
+			prepare: provision,
+			operation: func(state *Store, id string) (bool, error) {
+				return state.InterruptExpiredProvisioning(context.Background(), id, base.Add(2*time.Minute))
+			},
+			wantState: StateInterrupted,
+			wantCode:  "restart_during_provisioning",
+		},
+		{
+			name:    "interrupt expired starting",
+			prepare: start,
+			operation: func(state *Store, id string) (bool, error) {
+				return state.InterruptExpiredStarting(context.Background(), id, "restart_during_start", "start owner expired", base.Add(2*time.Minute))
+			},
+			wantState: StateInterrupted,
+			wantCode:  "restart_during_start",
+		},
+	}
+
+	for i, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			first, second := sharedStores(t)
+			syncJob(t, first, base.Add(-time.Hour))
+			id := fmt.Sprintf("contended-claim-%d", i)
+			run := testCase.prepare(t, first, id)
+			held := holdUnreadWrite(t, first, run.ID, false)
+			completeAfterHeldWrite(t, held, func() error {
+				finished, err := testCase.operation(second, run.ID)
+				if err != nil {
+					return err
+				}
+				if !finished {
+					return errors.New("claim completion or recovery lost its compare-and-set")
+				}
+				return nil
+			})
+			got, err := first.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != testCase.wantState || got.ErrorCode != testCase.wantCode || got.ProvisioningOwner != "" || !got.ProvisioningLeaseUntil.IsZero() || got.AcceptanceLane != config.AcceptanceMandatory {
+				t.Fatalf("claim completion or recovery was not fully persisted: %+v", got)
+			}
+			assertLaterInboxOrdering(t, first, second, run.ID, base.Add(3*time.Minute))
+		})
+	}
 }
 
 func TestListRunsGroupedByAcceptanceOrdersMandatorySampleAutoThenActive(t *testing.T) {

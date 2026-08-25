@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -379,6 +381,47 @@ func captureRunStdout(t *testing.T, fn func() error) (string, error) {
 	<-done
 	_ = read.Close()
 	return string(captured), runErr
+}
+
+func captureRunStderr(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	original := os.Stderr
+	read, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured []byte
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := read.Read(buf)
+			captured = append(captured, buf[:n]...)
+			if readErr != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	os.Stderr = writeEnd
+	runErr := fn()
+	os.Stderr = original
+	_ = writeEnd.Close()
+	<-done
+	_ = read.Close()
+	return string(captured), runErr
+}
+
+func TestRunsLimitHelpExplainsTerminalHistoryAndActiveRows(t *testing.T) {
+	help, err := captureRunStderr(t, func() error {
+		return run([]string{"runs", "--help"})
+	})
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("runs --help error=%v", err)
+	}
+	if !strings.Contains(help, "maximum terminal-history rows; active rows are always shown") {
+		t.Fatalf("runs --limit help is unclear:\n%s", help)
+	}
 }
 
 func TestRunsAndShowDisplayAcceptanceGroupingAndLegacyFields(t *testing.T) {

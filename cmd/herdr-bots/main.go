@@ -237,7 +237,7 @@ func listCmd(args []string) error {
 func runsCmd(args []string) error {
 	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
 	statePath := fs.String("state", defaultStatePath(), "SQLite state file")
-	limit := fs.Int("limit", 30, "maximum rows")
+	limit := fs.Int("limit", 30, "maximum terminal-history rows; active rows are always shown")
 	if err := fs.Parse(positionalFirst(args)); err != nil {
 		return err
 	}
