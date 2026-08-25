@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 versions with a `vMAJOR.MINOR.PATCH` prefix.
 
+## [Unreleased]
+
+### Added
+
+- Opt-in `execution.require_model_attestation` for `claude-code` jobs. The
+  attested launch asks the harness for a machine-readable result and, after the
+  command completes and before the verifier runs, binds that result to the
+  configured model: a first-party provider, a canonical model equal to the
+  configured full model name, and nonzero token usage. Anything absent,
+  malformed, or mismatched fails the run as `model_attestation_failed` rather
+  than downgrading to a weaker verdict. The contract requires a full
+  `claude-`-prefixed model name, rejecting aliases and `harness-default`, and is
+  invalid on Pi routes. Omitting the field leaves existing job snapshots and
+  launches byte-for-byte unchanged.
+- Opt-in bounded inputs and observed write scope. `execution.inputs` stages up
+  to 32 declared snapshots (16 MiB per file, 64 MiB per run) into the reserved
+  `.herdr-bots/inputs/` directory before the run, with `{date}`, `{year}`, and
+  `{month}` sources resolved in the job's timezone against the scheduled
+  occurrence; destinations are never overwritten and no write scope may name
+  that directory. `execution.allowed_write_paths` (requires
+  `repo-write-no-network`) declares exact paths and directory prefixes, and
+  never `.git`. Both produce durable deterministic receipts: what was staged,
+  with sizes and sha256 digests, and what the worktree changed, including
+  ignored files and a content fingerprint per changed path, under an
+  `observed_within_scope` verdict. Staged inputs are reproved before the change
+  set is read, the boundary is observed after the agent settles and rechecked
+  after the verifier runs in the same worktree, and an out-of-scope change fails
+  the run as `bounded_review_failed`. The verdict is post-run evidence under
+  shell-free permission profiles, not OS containment. Snapshots are retained in
+  the evidence worktree; the scheduler never deletes them.
+
 ## [0.2.0] - 2026-08-25
 
 macOS prerelease (preview): adds an opt-in unread-terminal-run attention guard

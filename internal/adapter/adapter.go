@@ -176,7 +176,10 @@ type claudeModelUsage struct {
 // so a later pane write can never supply the result. The last line that
 // independently parses as a Claude single-result object is the one the marker
 // reported on; absent, malformed, mismatched, or unused-model evidence is an
-// error rather than a weaker verdict. The returned receipt is deterministic
+// error rather than a weaker verdict. The proof is the exact expected usage
+// key plus a canonical model that matches it; additional usage entries stay
+// allowed because real Claude results report internal auxiliary model usage.
+// The returned receipt is deterministic
 // compact JSON, so the same transcript always yields the same durable bytes.
 func ParseClaudeModelAttestation(transcript, completionMarker, expectedModel string) (string, error) {
 	if completionMarker == "" {
@@ -211,8 +214,8 @@ func ParseClaudeModelAttestation(transcript, completionMarker, expectedModel str
 	if entry.Provider != claudeFirstPartyProvider {
 		return "", fmt.Errorf("%s: usage for %q reports provider %q, want %q", attestationFailure, expectedModel, entry.Provider, claudeFirstPartyProvider)
 	}
-	if entry.CanonicalModel == "" {
-		return "", fmt.Errorf("%s: usage for %q reports no canonical model", attestationFailure, expectedModel)
+	if entry.CanonicalModel != expectedModel {
+		return "", fmt.Errorf("%s: the result reports canonical model %q, want %q", attestationFailure, entry.CanonicalModel, expectedModel)
 	}
 	if entry.InputTokens <= 0 && entry.OutputTokens <= 0 {
 		return "", fmt.Errorf("%s: usage for %q reports no input or output tokens", attestationFailure, expectedModel)

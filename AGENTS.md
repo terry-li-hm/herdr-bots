@@ -57,6 +57,17 @@ launchd supervises the scheduler process. Herdr does not.
 9. Installing launchd, linking the plugin, enabling a job, pushing,
    publishing, or creating a remote requires its own authority outside this
    repository.
+10. A new bounded job retains its staged snapshots. Nothing in the scheduler
+    deletes a staged input or the worktree holding it; the snapshots are the
+    evidence a receipt is checked against, and reclaiming them belongs to
+    whoever owns the worktree's lifecycle.
+11. An attested Claude job names a canonical full model, never an alias such
+    as `opus` and never `harness-default`. Attestation compares the harness's
+    reported canonical model against that exact name.
+12. A bounded boundary is re-observed after the verifier finishes, because the
+    verifier runs unrestricted in the same worktree. The second observation
+    must recompute the first receipt's bytes; any changed fingerprint fails
+    the run.
 
 ## Extension pattern
 
@@ -80,6 +91,13 @@ When adding a lifecycle feature:
   keeps the native subscription route and `--tools` availability boundary.
 - The no-network profiles enforce their boundary by omitting shell and web
   tools. Adding Bash or another shell invalidates that claim.
+- `observed_within_scope` is a post-run observation of the worktree, not
+  containment. It is worth recording only because the profiles launched here
+  stay shell-free and web-free, so a run reaches the workspace through file
+  edits git can be asked to enumerate. A run that could execute arbitrary code
+  could write where no receipt would ever mention it. Never document or name
+  the verdict as a sandbox, and never grant a bounded job a shell or web tool
+  to make the observation more convenient.
 - A run interrupted during provisioning or unconfirmed start is not replayed
   because its external effects may be uncertain. Reconciliation preserves a
   live owner lease through receipt-bearing `starting`, interrupts only

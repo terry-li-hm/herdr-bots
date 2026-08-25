@@ -57,27 +57,30 @@ func (f fakeCommands) Run(ctx context.Context, name string, args ...string) ([]b
 }
 
 type fakeHerdr struct {
-	mu                sync.Mutex
-	provisions        int
-	kind              string
-	args              []string
-	status            string
-	path              string
-	command           string
-	commandCode       int
-	commandErr        error
-	agentWaitErr      error
-	waitCh            <-chan struct{}
-	provisionCreated  chan<- struct{}
-	provisionGate     <-chan struct{}
-	provisionReceipt  herdr.Receipt
-	provisionErr      error
-	submitStarted     chan<- struct{}
-	submitGate        <-chan struct{}
-	startAgentCount   int
-	startAgentErr     error
-	submitCount       int
-	submitErr         error
+	mu               sync.Mutex
+	provisions       int
+	kind             string
+	args             []string
+	status           string
+	path             string
+	command          string
+	commandCode      int
+	commandErr       error
+	agentWaitErr     error
+	waitCh           <-chan struct{}
+	provisionCreated chan<- struct{}
+	provisionGate    <-chan struct{}
+	provisionReceipt herdr.Receipt
+	provisionErr     error
+	submitStarted    chan<- struct{}
+	submitGate       <-chan struct{}
+	startAgentCount  int
+	startAgentErr    error
+	submitCount      int
+	submitErr        error
+	// submitMutation stands in for what the agent does to the workspace once it
+	// has the prompt. It runs outside the mutex so it may inspect this fake.
+	submitMutation    func()
 	statusCount       int
 	closeCount        int
 	closeErr          error
@@ -180,7 +183,7 @@ func (f *fakeHerdr) Submit(ctx context.Context, _ string, prompt string) error {
 	f.mu.Lock()
 	f.submitCount++
 	f.prompt = prompt
-	started, gate := f.submitStarted, f.submitGate
+	started, gate, mutate := f.submitStarted, f.submitGate, f.submitMutation
 	f.mu.Unlock()
 	if started != nil {
 		select {
@@ -194,6 +197,9 @@ func (f *fakeHerdr) Submit(ctx context.Context, _ string, prompt string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if mutate != nil {
+		mutate()
 	}
 	return f.submitErr
 }

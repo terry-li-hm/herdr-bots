@@ -720,7 +720,15 @@ func (e *Engine) execute(ctx context.Context, run store.Run) {
 	run.WorkspaceID, run.PaneID, run.Branch, run.WorktreePath = receipt.WorkspaceID, receipt.PaneID, receipt.Branch, receipt.Path
 	run.ExecutionMode, run.CompletionMarker = launch.Mode, marker
 	run.State = store.StateStarting
-	prompt := sourceAwarePrompt(job.Prompt, run.InputContext)
+	if job.Execution.HasBoundedInputs() {
+		inputReceipt, err := e.stageBoundedInputs(ctx, run, job)
+		if err != nil {
+			e.failStarting(ctx, run.ID, "input_staging_failed", err)
+			return
+		}
+		run.InputReceipt = inputReceipt
+	}
+	prompt := boundedReviewPrompt(sourceAwarePrompt(job.Prompt, run.InputContext), job, run.InputReceipt)
 	if launch.Mode == adapter.ModeCommand {
 		promptPath, cleanup, err := temporaryPrompt(prompt)
 		if err != nil {
@@ -1089,6 +1097,14 @@ func (e *Engine) monitor(ctx context.Context, run store.Run, known string) {
 		e.recordMonitoredPersistence(run.ID, e.interruptAndClose(run, "agent_gone", "Herdr agent is no longer present; workspace cleanup was required"))
 		return
 	}
+	if job.Execution.HasBoundedInputs() || job.Execution.HasWriteScope() {
+		changeReceipt, err := e.verifyBoundedReview(ctx, run, job)
+		if err != nil {
+			e.fail(ctx, run, state, "bounded_review_failed", err)
+			return
+		}
+		run.ChangeReceipt = changeReceipt
+	}
 	if state != store.StateSettled && state != store.StateVerifying {
 		if err := e.Store.Transition(ctx, run.ID, state, store.StateSettled, "agent settled", time.Now()); err != nil {
 			e.recordMonitoredPersistence(run.ID, err)
@@ -1135,6 +1151,15 @@ func (e *Engine) monitor(ctx context.Context, run store.Run, known string) {
 			} else {
 				detail = fmt.Sprintf("verifier exited %d", code)
 			}
+		}
+	}
+	if job.Execution.HasBoundedInputs() || job.Execution.HasWriteScope() {
+		// The verifier ran inside the worktree, so the boundary is re-observed
+		// after it finishes. The first receipt stays in run.ChangeReceipt: an
+		// identical re-observation succeeds and any changed fingerprint conflicts.
+		if _, err := e.verifyBoundedReview(ctx, run, job); err != nil {
+			terminalState, verdict, errorCode = store.StateFailed, "unverified", "bounded_review_failed"
+			detail = "post-verifier boundary check: " + err.Error()
 		}
 	}
 	finished, finishErr := e.Store.FinishEffect(ctx, run.ID, store.StateVerifying, e.owner, claim, store.EffectVerifier, terminalState, "completed", "completed", verdict, errorCode, detail, e.now())
@@ -1523,9 +1548,11 @@ func (e *Engine) reconcileExpiredVerifier(ctx context.Context, run store.Run) {
 		return
 	}
 	terminalState, verdict, code, detail := store.StateInterrupted, "unverified", "restart_during_verifier", "verifier ownership expired without a durable result"
+	durableResultRead := false
 	if run.EffectReceipt == "" {
 		code, detail = "missing_verifier_receipt", "verifier run has no durable result receipt"
 	} else if resultCode, output, err := e.readVerifierReceipt(run); err == nil {
+		durableResultRead = true
 		detail = output
 		if resultCode == 0 {
 			terminalState, verdict, code = store.StateSucceeded, "passed", ""
@@ -1534,6 +1561,22 @@ func (e *Engine) reconcileExpiredVerifier(ctx context.Context, run store.Run) {
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		code, detail = "invalid_verifier_receipt", err.Error()
+	}
+	if durableResultRead {
+		// The verifier ran to completion inside the worktree, so the boundary is
+		// re-observed here exactly as the owning monitor would have done before
+		// persisting its outcome. Only a durable result reaches this check;
+		// interrupted outcomes carry no completed verifier to bound.
+		var job config.Job
+		if err := json.Unmarshal(run.Definition, &job); err != nil {
+			terminalState, verdict, code = store.StateFailed, "unverified", "bounded_review_failed"
+			detail = "post-verifier boundary check: invalid snapshot: " + err.Error()
+		} else if job.Execution.HasBoundedInputs() || job.Execution.HasWriteScope() {
+			if _, err := e.verifyBoundedReview(ctx, run, job); err != nil {
+				terminalState, verdict, code = store.StateFailed, "unverified", "bounded_review_failed"
+				detail = "post-verifier boundary check: " + err.Error()
+			}
+		}
 	}
 	infrastructure := "completed"
 	if terminalState == store.StateInterrupted {

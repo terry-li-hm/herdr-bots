@@ -290,8 +290,19 @@ func showCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("run: %s\njob: %s\nstate: %s\ninfrastructure: %s\nagent: %s\nverdict: %s\nlane: %s\nreason: %s\nsource-base: %s\nsource: %s\nworkspace: %s\npane: %s\nworktree: %s\nerror: %s %s\n", run.ID, run.JobID, run.State, run.InfrastructureResult, run.AgentResult, run.TaskVerdict, displayField(run.AcceptanceLane), displayField(run.AcceptanceReason), run.SourceBaseRevision, run.SourceRevision, run.WorkspaceID, run.PaneID, run.WorktreePath, run.ErrorCode, run.ErrorDetail)
+	fmt.Printf("run: %s\njob: %s\nstate: %s\ninfrastructure: %s\nagent: %s\nverdict: %s\nlane: %s\nreason: %s\nmodel-attestation: %s\ninput-receipt: %s\nchange-receipt: %s\nsource-base: %s\nsource: %s\nworkspace: %s\npane: %s\nworktree: %s\nerror: %s %s\n", run.ID, run.JobID, run.State, run.InfrastructureResult, run.AgentResult, run.TaskVerdict, displayField(run.AcceptanceLane), displayField(run.AcceptanceReason), receiptField(run.ModelAttestation), receiptField(run.InputReceipt), receiptField(run.ChangeReceipt), run.SourceBaseRevision, run.SourceRevision, run.WorkspaceID, run.PaneID, run.WorktreePath, run.ErrorCode, run.ErrorDetail)
 	return state.MarkRead(context.Background(), run.ID)
+}
+
+// receiptField reports a durable receipt for display. A stored receipt is the
+// compact JSON its writer attested, so it is reproduced verbatim rather than
+// reformatted; an absent receipt reports as absent instead of as an empty
+// document.
+func receiptField(receipt string) string {
+	if receipt == "" {
+		return "-"
+	}
+	return receipt
 }
 
 func paneCmd(args []string) error {
