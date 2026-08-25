@@ -119,11 +119,15 @@ type Run struct {
 	AcceptanceLane         string
 	AcceptanceReason       string
 	Unread                 bool
+	// ModelAttestation is the durable receipt binding a finished agent
+	// invocation to the configured model. It is written once and never
+	// rewritten with a different value.
+	ModelAttestation string
 }
 
 // runColumns is the canonical run projection; every scanner and query must
 // use it so persisted admission fields stay coherent across reads.
-const runColumns = `id,job_id,job_revision,definition,trigger,scheduled_for,state,infrastructure_result,agent_result,task_verdict,accepted_at,accepted_unix_nano,updated_at,workspace_id,pane_id,branch,worktree_path,execution_mode,completion_marker,source_base_revision,source_revision,input_context,error_code,error_detail,provisioning_owner,provisioning_lease_until,effect_owner,effect_claim,effect_kind,effect_lease_until,effect_receipt,disk_device,disk_reserve_gib,acceptance_lane,acceptance_reason,unread`
+const runColumns = `id,job_id,job_revision,definition,trigger,scheduled_for,state,infrastructure_result,agent_result,task_verdict,accepted_at,accepted_unix_nano,updated_at,workspace_id,pane_id,branch,worktree_path,execution_mode,completion_marker,source_base_revision,source_revision,input_context,error_code,error_detail,provisioning_owner,provisioning_lease_until,effect_owner,effect_claim,effect_kind,effect_lease_until,effect_receipt,disk_device,disk_reserve_gib,acceptance_lane,acceptance_reason,unread,model_attestation`
 
 type AcceptRequest struct {
 	JobID              string
@@ -362,6 +366,7 @@ CREATE TABLE IF NOT EXISTS runs (
   acceptance_lane TEXT NOT NULL DEFAULT '',
   acceptance_reason TEXT NOT NULL DEFAULT '',
   unread INTEGER NOT NULL DEFAULT 1,
+  model_attestation TEXT NOT NULL DEFAULT '',
   FOREIGN KEY(job_id) REFERENCES jobs(id)
 );
 CREATE INDEX IF NOT EXISTS runs_job_state ON runs(job_id, state);
@@ -408,6 +413,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 		{"runs", "input_context", "TEXT NOT NULL DEFAULT ''"},
 		{"jobs", "pause_reason", "TEXT NOT NULL DEFAULT ''"},
 		{"jobs", "pause_at", "TEXT NOT NULL DEFAULT ''"},
+		{"runs", "model_attestation", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range columns {
 		if err = ensureColumn(ctx, conn, column.table, column.column, column.definition); err != nil {
@@ -1782,6 +1788,53 @@ func (s *Store) SetSourceContext(ctx context.Context, id, baseRevision, revision
 	return nil
 }
 
+// SetModelAttestation binds one run to the model receipt observed for its
+// agent invocation. The read and the compare-and-set share one transaction so
+// a second writer can never replace a receipt that is already durable. Before
+// the run settles, a repeated identical receipt is an idempotent success; any
+// other stored receipt or a missing run conflicts and changes nothing. Once a
+// run is terminal its attestation is closed, so every attempt conflicts,
+// including one repeating the receipt already stored.
+func (s *Store) SetModelAttestation(ctx context.Context, id, receipt string) error {
+	if receipt == "" {
+		return errors.New("model attestation receipt is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state, existing string
+	err = tx.QueryRowContext(ctx, `SELECT state,model_attestation FROM runs WHERE id=?`, id).Scan(&state, &existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: run %s has no persisted row to attest", ErrStateConflict, id)
+	}
+	if err != nil {
+		return err
+	}
+	// A terminal run is checked before the idempotent repeat so that no
+	// attestation, not even one identical to the stored receipt, can be
+	// reported as accepted after the run has settled.
+	if terminalStates[state] {
+		return fmt.Errorf("%w: run %s is terminal in %s and cannot be attested", ErrStateConflict, id, state)
+	}
+	if existing == receipt {
+		return nil
+	}
+	if existing != "" {
+		return fmt.Errorf("%w: run %s already attested a different model receipt", ErrStateConflict, id)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE runs SET model_attestation=?,updated_at=? WHERE id=? AND state=? AND model_attestation=''`, receipt, formatTime(time.Now()), id, state)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("%w: run %s did not accept a model attestation from %s", ErrStateConflict, id, state)
+	}
+	return tx.Commit()
+}
+
 func (s *Store) LastSuccessfulSource(ctx context.Context, jobID string) (SuccessfulSource, error) {
 	var source SuccessfulSource
 	err := s.db.QueryRowContext(ctx, `SELECT job_revision,source_revision FROM runs WHERE job_id=? AND state='succeeded' AND source_revision<>'' ORDER BY accepted_unix_nano DESC,id DESC LIMIT 1`, jobID).Scan(&source.JobRevision, &source.SourceRevision)
@@ -2440,7 +2493,7 @@ func scanRun(row scanner) (Run, error) {
 	var accepted, updated string
 	var provisioningLeaseUntil, effectLeaseUntil int64
 	var unread int
-	err := row.Scan(&out.ID, &out.JobID, &out.JobRevision, &out.Definition, &out.Trigger, &scheduled, &out.State, &out.InfrastructureResult, &out.AgentResult, &out.TaskVerdict, &accepted, &out.AcceptedUnixNano, &updated, &out.WorkspaceID, &out.PaneID, &out.Branch, &out.WorktreePath, &out.ExecutionMode, &out.CompletionMarker, &out.SourceBaseRevision, &out.SourceRevision, &out.InputContext, &out.ErrorCode, &out.ErrorDetail, &out.ProvisioningOwner, &provisioningLeaseUntil, &out.EffectOwner, &out.EffectClaim, &out.EffectKind, &effectLeaseUntil, &out.EffectReceipt, &out.DiskDevice, &out.DiskReserveGiB, &out.AcceptanceLane, &out.AcceptanceReason, &unread)
+	err := row.Scan(&out.ID, &out.JobID, &out.JobRevision, &out.Definition, &out.Trigger, &scheduled, &out.State, &out.InfrastructureResult, &out.AgentResult, &out.TaskVerdict, &accepted, &out.AcceptedUnixNano, &updated, &out.WorkspaceID, &out.PaneID, &out.Branch, &out.WorktreePath, &out.ExecutionMode, &out.CompletionMarker, &out.SourceBaseRevision, &out.SourceRevision, &out.InputContext, &out.ErrorCode, &out.ErrorDetail, &out.ProvisioningOwner, &provisioningLeaseUntil, &out.EffectOwner, &out.EffectClaim, &out.EffectKind, &effectLeaseUntil, &out.EffectReceipt, &out.DiskDevice, &out.DiskReserveGiB, &out.AcceptanceLane, &out.AcceptanceReason, &unread, &out.ModelAttestation)
 	if err != nil {
 		return out, err
 	}
