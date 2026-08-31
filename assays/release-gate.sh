@@ -182,7 +182,9 @@ note 'corrected publication contracts hold'
 #    Allowlisted public strings (Terry Li, terry-li-hm, Thomas Legrand,
 #    terry.herdr-bots) are intentional and not listed here. The scan covers
 #    tracked and untracked (not ignored) files so a pre-commit working tree
-#    is gated as strictly as a clean export.
+#    is gated as strictly as a clean export. The home-path pattern expresses
+#    both slashes as single-character bracket expressions: an equivalent
+#    regex, but never an argument that itself looks like a literal path.
 if ! command -v git >/dev/null 2>&1 || ! git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
     fail 'release gate must run inside a git checkout of the release tree'
 fi
@@ -193,7 +195,7 @@ leaks=$(git -C "$root" ls-files --cached --others --exclude-standard | while IFS
         -e 'cumora' \
         -e 'chromatin' \
         -e 'epigenome' \
-        -e '/Users/terry' \
+        -e '[/]Users[/]terry' \
         -e 'docs/solutions' \
         -e 'oscillators' \
         -e 'pilot' \
