@@ -124,7 +124,7 @@ func LaunchFor(job config.Job) (Launch, error) {
 		if job.Execution.Model != "harness-default" {
 			args = append(args, "--model", job.Execution.Model)
 		}
-		args = append(args, "--effort", job.Execution.Thinking, "--safe-mode", "--no-chrome", "--no-session-persistence", "--strict-mcp-config")
+		args = append(args, "--effort", job.Execution.Thinking, "--safe-mode", "--restricted", "--no-chrome", "--no-session-persistence", "--strict-mcp-config")
 		// The attested launch contract requires a machine-readable result so a
 		// later slice can bind the outcome to the configured model. Ordinary
 		// Claude launches stay byte-for-byte unchanged.

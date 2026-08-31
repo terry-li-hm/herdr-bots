@@ -84,7 +84,7 @@ func TestClaudeRepoWriteStillDeniesShellAndWeb(t *testing.T) {
 	for _, arg := range got.Args {
 		joined += " " + arg
 	}
-	for _, required := range []string{"--safe-mode", "--strict-mcp-config", "acceptEdits", "Read,Glob,Grep,Edit,Write"} {
+	for _, required := range []string{"--safe-mode", "--restricted", "--strict-mcp-config", "acceptEdits", "Read,Glob,Grep,Edit,Write"} {
 		if !contains(joined, required) {
 			t.Fatalf("%q missing from %q", required, joined)
 		}
@@ -99,7 +99,7 @@ func TestClaudeLaunchArgvIsUnchangedWithoutAttestation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"--model", "claude-opus-5", "--effort", "high", "--safe-mode", "--no-chrome", "--no-session-persistence", "--strict-mcp-config", "--permission-mode", "plan", "--tools", "Read,Glob,Grep"}
+	want := []string{"--model", "claude-opus-5", "--effort", "high", "--safe-mode", "--restricted", "--no-chrome", "--no-session-persistence", "--strict-mcp-config", "--permission-mode", "plan", "--tools", "Read,Glob,Grep"}
 	if got.Mode != ModeCommand || got.Kind != "claude" || !reflect.DeepEqual(got.Args, want) {
 		t.Fatalf("got %+v want %v", got, want)
 	}
@@ -112,7 +112,7 @@ func TestAttestedClaudeLaunchAddsJSONOutputFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"--model", "claude-opus-5", "--effort", "high", "--safe-mode", "--no-chrome", "--no-session-persistence", "--strict-mcp-config", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep"}
+	want := []string{"--model", "claude-opus-5", "--effort", "high", "--safe-mode", "--restricted", "--no-chrome", "--no-session-persistence", "--strict-mcp-config", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep"}
 	if got.Mode != ModeCommand || got.Kind != "claude" || !reflect.DeepEqual(got.Args, want) {
 		t.Fatalf("got %+v want %v", got, want)
 	}

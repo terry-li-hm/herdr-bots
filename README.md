@@ -337,6 +337,14 @@ about. It is not OS containment: nothing here is a sandbox, and a run able to
 execute arbitrary code could write outside the worktree entirely, where no
 receipt would mention it.
 
+Every Claude Code command the scheduler builds launches with `--safe-mode`
+and `--restricted` together with `--strict-mcp-config` and
+`--no-session-persistence`, with no shell or web tools available and file
+tools confined to the job's worktree. These flags are launch isolation, not
+disclosure control: repository choice remains a disclosure boundary, so a job
+must not point an ineligible model route at a repository containing material
+outside that route, even when the staged inputs for a given run are narrower.
+
 A bounded review job has no more publication authority than any other job: the
 scheduler never merges, pushes, or sends a message, and it never cleans up the
 worktree for you.
