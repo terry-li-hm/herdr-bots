@@ -214,6 +214,62 @@ func TestRecoverCLIRefusesMalformedInventoryWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestRecoverCLIRecoveryWorksBesideNativeDetachedEntry(t *testing.T) {
+	dir := t.TempDir()
+	// A native-shaped unrelated detached row must neither fail decoding nor
+	// prevent verified absence of the planned branch.
+	writeHerdrStub(t, dir, `{"result":{"worktrees":[{"path":"/tmp/synthetic-native","is_detached":true,"is_bare":false,"is_prunable":false,"is_linked_worktree":true,"label":"synthetic-detached"}]}}`)
+	runID, statePath := cliRecoveryFixture(t, dir)
+	out, err := captureRunStdout(t, func() error {
+		return run([]string{"recover", runID, "--config", filepath.Join(dir, "missing.yaml"), "--state", statePath})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, runID) || !strings.Contains(out, store.StateInterrupted) {
+		t.Fatalf("output=%q want run id and interrupted state", out)
+	}
+	state, openErr := store.Open(statePath)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer state.Close()
+	got := mustGetCLIRun(t, state, runID)
+	if got.State != store.StateInterrupted || got.ErrorCode != store.RecoveryCodeProvisioning {
+		t.Fatalf("run=%+v", got)
+	}
+}
+
+func TestRecoverCLIRefusesAmbiguousBranchlessEntryWithoutMutation(t *testing.T) {
+	dir := t.TempDir()
+	// Neither flag is true, so the missing branch is ambiguous: recovery must
+	// refuse without changing run state or writing recovery events.
+	writeHerdrStub(t, dir, `{"result":{"worktrees":[{"path":"/tmp/synthetic-ambiguous","is_detached":false,"is_bare":false}]}}`)
+	runID, statePath := cliRecoveryFixture(t, dir)
+	err := run([]string{"recover", runID, "--config", filepath.Join(dir, "missing.yaml"), "--state", statePath})
+	if err == nil || !strings.Contains(err.Error(), "worktree inventory") {
+		t.Fatalf("error=%v want a fail-closed inventory error", err)
+	}
+	state, openErr := store.Open(statePath)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer state.Close()
+	got := mustGetCLIRun(t, state, runID)
+	if got.State != store.StateProvisioning || got.WorkspaceID != "" || got.ProvisioningOwner != "stopped-daemon" || got.ErrorCode != "" {
+		t.Fatalf("ambiguous branchless entry mutated the run: %+v", got)
+	}
+	events, eventErr := state.Events(context.Background(), runID)
+	if eventErr != nil {
+		t.Fatal(eventErr)
+	}
+	for _, event := range events {
+		if event.Code == store.RecoveryCodeProvisioning {
+			t.Fatalf("ambiguous branchless entry wrote a typed recovery event: %+v", event)
+		}
+	}
+}
+
 func TestUsageDocumentsRecoverCommand(t *testing.T) {
 	out, err := captureRunStdout(t, func() error {
 		return run([]string{"help"})

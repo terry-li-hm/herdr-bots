@@ -236,7 +236,7 @@ operator supplies `--canary`.
 
 Recovery records the run as `interrupted` with an explicit recovery event. It does not claim successful work or cancellation. Terminal states stay immutable. The database transition is bound to the row observed before the inventory lookup, so claim renewal or receipt changes cannot be overwritten.
 
-This command never evaluates schedules, dispatches work, probes model authentication, creates or closes a workspace, or resumes a job. It keeps the existing cancellation guards and daemon transition logic. Shared worktree inventory parsing now rejects missing, null or incomplete inventories. Obtain approval for the exact run before invoking it. Starting Herdr remains a separate action because it can restore saved agents and execute plugin hooks.
+This command never evaluates schedules, dispatches work, probes model authentication, creates or closes a workspace, or resumes a job. It keeps the existing cancellation guards and daemon transition logic. Shared worktree inventory parsing rejects missing, null or incomplete inventories. Native detached and bare entries may omit `branch` only when a corresponding boolean flag is true; ambiguous or contradictory entries remain errors. Obtain approval for the exact run before invoking it. Starting Herdr remains a separate action because it can restore saved agents and execute plugin hooks.
 
 ## Unread-work guard (opt-in)
 

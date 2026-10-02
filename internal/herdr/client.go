@@ -121,21 +121,44 @@ func (c *CLI) WorkspaceExists(ctx context.Context, workspaceID string) (bool, er
 }
 
 // worktreeInventoryEntry is one strictly decoded worktree list row. A nil
-// branch is a legitimate detached worktree (explicit JSON null), never a
-// missing key: a row whose branch is absent is refused because its meaning
-// is unknown.
+// branch marks a branchless record: the row carries an explicit branch (a
+// nonempty string, or null for a detached worktree), or affirmatively
+// identifies itself as branchless through is_detached:true or is_bare:true.
+// Anything else is refused because its meaning is unknown.
 type worktreeInventoryEntry struct {
 	branch *string
 	path   string
+}
+
+// decodeInventoryFlag decodes an optional boolean inventory flag strictly:
+// absent is unknown, and null, strings, numbers and containers fail closed
+// rather than decoding into a zero value.
+func decodeInventoryFlag(raw json.RawMessage, name string) (*bool, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if isJSONNull(raw) {
+		return nil, fmt.Errorf("%s is null, not a boolean", name)
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("%s is not a boolean: %w", name, err)
+	}
+	return &value, nil
 }
 
 // decodeWorktreeInventory decodes a worktree list inventory strictly, because
 // this inventory is an absence proof for workspace recovery. The array must be
 // explicitly present and non-null: a missing or null inventory must never read
 // as an empty one, and a skipped or half-decoded row must never silently
-// disappear from the match. Every entry must carry an explicit branch (a
-// string, or null for a detached worktree) and a nonempty string path; wrong
-// types fail closed instead of decoding into zero values.
+// disappear from the match. The native schema makes branch optional: an
+// omitted branch is accepted only when is_detached:true or is_bare:true
+// affirms the row is branchless, and a null branch stays accepted as legacy
+// detached evidence unless flags are present and deny it. Flags are decoded
+// strictly, both-true and named-branch-beside-a-true-flag are contradictory,
+// an empty string is never valid branch evidence, and every entry needs a
+// nonempty string path; wrong types fail closed instead of decoding into
+// zero values.
 func decodeWorktreeInventory(raw json.RawMessage) ([]worktreeInventoryEntry, error) {
 	if len(raw) == 0 {
 		return nil, errors.New("worktrees array is missing")
@@ -153,20 +176,49 @@ func decodeWorktreeInventory(raw json.RawMessage) ([]worktreeInventoryEntry, err
 			return nil, fmt.Errorf("worktrees[%d] is null", i)
 		}
 		var fields struct {
-			Branch json.RawMessage `json:"branch"`
-			Path   json.RawMessage `json:"path"`
+			Branch     json.RawMessage `json:"branch"`
+			Path       json.RawMessage `json:"path"`
+			IsDetached json.RawMessage `json:"is_detached"`
+			IsBare     json.RawMessage `json:"is_bare"`
 		}
 		if err := json.Unmarshal(row, &fields); err != nil {
 			return nil, fmt.Errorf("worktrees[%d] is not an object: %w", i, err)
 		}
+		detached, err := decodeInventoryFlag(fields.IsDetached, fmt.Sprintf("worktrees[%d].is_detached", i))
+		if err != nil {
+			return nil, err
+		}
+		bare, err := decodeInventoryFlag(fields.IsBare, fmt.Sprintf("worktrees[%d].is_bare", i))
+		if err != nil {
+			return nil, err
+		}
+		branchless := (detached != nil && *detached) || (bare != nil && *bare)
+		if detached != nil && *detached && bare != nil && *bare {
+			return nil, fmt.Errorf("worktrees[%d] is both detached and bare", i)
+		}
 		var branch *string
 		switch {
 		case len(fields.Branch) == 0:
-			return nil, fmt.Errorf("worktrees[%d] has no branch", i)
-		case !isJSONNull(fields.Branch):
+			if !branchless {
+				return nil, fmt.Errorf("worktrees[%d] has no branch", i)
+			}
+		case isJSONNull(fields.Branch):
+			if branchless {
+				break
+			}
+			if detached != nil || bare != nil {
+				return nil, fmt.Errorf("worktrees[%d] has a null branch but no branchless flag is true", i)
+			}
+		default:
 			var name string
 			if err := json.Unmarshal(fields.Branch, &name); err != nil {
 				return nil, fmt.Errorf("worktrees[%d] has a non-string branch: %w", i, err)
+			}
+			if name == "" {
+				return nil, fmt.Errorf("worktrees[%d] has an empty branch", i)
+			}
+			if branchless {
+				return nil, fmt.Errorf("worktrees[%d] names a branch beside a branchless flag", i)
 			}
 			branch = &name
 		}

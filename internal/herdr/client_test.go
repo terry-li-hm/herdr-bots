@@ -212,6 +212,84 @@ func TestFindWorkspaceByBranchMatchesNamedEntryAlongsideDetachedOnes(t *testing.
 	}
 }
 
+func TestFindWorkspaceByBranchHandlesNativeBranchlessForms(t *testing.T) {
+	// Native herdr makes branch optional and marks branchless rows with
+	// is_detached or is_bare. A branchless row is accepted and never matches a
+	// named branch; a named target beside such rows still matches.
+	for name, tc := range map[string]struct {
+		output   string
+		wantHit  bool
+		wantPath string
+	}{
+		"omitted branch detached": {
+			output: `{"result":{"worktrees":[{"path":"/tmp/native","is_detached":true,"is_bare":false}]}}`,
+		},
+		"omitted branch bare": {
+			output: `{"result":{"worktrees":[{"path":"/tmp/native","is_detached":false,"is_bare":true}]}}`,
+		},
+		"named target beside a detached row": {
+			output:   `{"result":{"worktrees":[{"path":"/tmp/native","is_detached":true,"is_bare":false,"is_prunable":false,"is_linked_worktree":true,"label":"native-detached"},{"branch":"auto/job/planned","path":"/tmp/planned"}]}}`,
+			wantHit:  true,
+			wantPath: "/tmp/planned",
+		},
+		"named target beside a bare row": {
+			output:   `{"result":{"worktrees":[{"path":"/tmp/native","is_bare":true},{"branch":"auto/job/planned","path":"/tmp/planned"}]}}`,
+			wantHit:  true,
+			wantPath: "/tmp/planned",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &CLI{Bin: writeInventoryStub(t, tc.output)}
+			receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if found != tc.wantHit || receipt.Path != tc.wantPath {
+				t.Fatalf("receipt=%+v found=%t want hit=%t path=%q", receipt, found, tc.wantHit, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestFindWorkspaceByBranchFailsClosedOnBadBranchlessFlags(t *testing.T) {
+	for name, output := range map[string]string{
+		"ambiguous missing branch":     `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":false,"is_bare":false}]}}`,
+		"ambiguous null branch":        `{"result":{"worktrees":[{"branch":null,"path":"/tmp/wt","is_detached":false,"is_bare":false}]}}`,
+		"null detached flag":           `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":null}]}}`,
+		"string bare flag":             `{"result":{"worktrees":[{"path":"/tmp/wt","is_bare":"true"}]}}`,
+		"numeric detached flag":        `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":1}]}}`,
+		"bad bare beside detached":     `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":true,"is_bare":"bad"}]}}`,
+		"container detached flag":      `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":[]}]}}`,
+		"both flags true":              `{"result":{"worktrees":[{"path":"/tmp/wt","is_detached":true,"is_bare":true}]}}`,
+		"named branch beside detached": `{"result":{"worktrees":[{"branch":"auto/job/planned","path":"/tmp/wt","is_detached":true}]}}`,
+		"named branch beside bare":     `{"result":{"worktrees":[{"branch":"auto/job/planned","path":"/tmp/wt","is_bare":true}]}}`,
+		"empty string branch":          `{"result":{"worktrees":[{"branch":"","path":"/tmp/wt"}]}}`,
+		"empty string branch detached": `{"result":{"worktrees":[{"branch":"","path":"/tmp/wt","is_detached":true}]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &CLI{Bin: writeInventoryStub(t, output)}
+			receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+			if err == nil || found {
+				t.Fatalf("receipt=%+v found=%t err=%v want a fail-closed decoding error", receipt, found, err)
+			}
+			if !strings.Contains(err.Error(), "worktree inventory") {
+				t.Fatalf("error=%v does not name the worktree inventory", err)
+			}
+		})
+	}
+}
+
+func TestFindWorkspaceByBranchKeepsLegacyDetachedAndNamedForms(t *testing.T) {
+	// Legacy rows without flags keep their old meaning: branch:null is a
+	// detached worktree, and a named branch matches directly.
+	output := `{"result":{"worktrees":[{"branch":null,"path":"/tmp/detached"},{"branch":"auto/job/planned","path":"/tmp/planned"}]}}`
+	client := &CLI{Bin: writeInventoryStub(t, output)}
+	receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+	if err != nil || !found || receipt.Path != "/tmp/planned" {
+		t.Fatalf("receipt=%+v found=%t err=%v", receipt, found, err)
+	}
+}
+
 func TestShellQuoteKeepsACompoundCommandInOneArgument(t *testing.T) {
 	got := shellQuote("claude -p 'prompt'; printf done")
 	want := `'claude -p '\''prompt'\''; printf done'`
