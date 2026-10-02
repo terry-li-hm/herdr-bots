@@ -437,6 +437,12 @@ above, and the worktrees listed in `herdr-bots runs`/`show` output yourself.
   after the command completes and before the verifier runs, failing the run if
   the observed canonical model is not the configured one. No provider, model,
   harness, or permission fallback exists on any route.
+- Pi model discovery disables ambient extensions, skills, prompt templates
+  and context files, matching the resource-discovery boundary of Pi jobs.
+  This is not an OS sandbox or a read-only guarantee: Pi still initializes
+  its core runtime, and `doctor` opens and may migrate the selected SQLite
+  database. Use an isolated temporary state path for diagnostic assays;
+  that alone does not isolate harness startup or authentication storage.
 - Fresh worktrees are mandatory; root execution is rejected.
 - No-task-network permission profiles omit task-controlled shell and web
   tools. A blocked approval is a terminal result, never a prompt the

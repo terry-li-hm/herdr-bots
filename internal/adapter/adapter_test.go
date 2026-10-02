@@ -12,12 +12,20 @@ import (
 type fakeRunner struct {
 	outputs map[string][]byte
 	missing map[string]bool
+	fail    map[string]bool
+	calls   *[][]string
 }
 
 func (f fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	key := name
 	if len(args) > 0 {
 		key += " " + args[0]
+	}
+	if f.fail[key] {
+		return nil, errors.New("command failed: " + key)
+	}
+	if f.calls != nil {
+		*f.calls = append(*f.calls, append([]string{name}, args...))
 	}
 	out, ok := f.outputs[key]
 	if !ok {
@@ -38,8 +46,8 @@ func piJob() config.Job {
 
 func TestProbePiRequiresObservedExactRoute(t *testing.T) {
 	f := fakeRunner{outputs: map[string][]byte{
-		"pi auth":          []byte(`{"status":"ready","provider":"openai-codex"}`),
-		"pi --list-models": []byte("provider model context\nopenai-codex gpt-5.6-sol 272K\n"),
+		"pi auth":            []byte(`{"status":"ready","provider":"openai-codex"}`),
+		"pi --no-extensions": []byte("provider model context\nopenai-codex gpt-5.6-sol 272K\n"),
 	}}
 	if err := Probe(context.Background(), f, piJob()); err != nil {
 		t.Fatal(err)
@@ -48,6 +56,70 @@ func TestProbePiRequiresObservedExactRoute(t *testing.T) {
 	job.Execution.Model = "missing"
 	if err := Probe(context.Background(), f, job); err == nil {
 		t.Fatal("missing model should fail closed")
+	}
+}
+
+func TestProbePiModelListUsesRestrictedArgvInOrder(t *testing.T) {
+	var calls [][]string
+	f := fakeRunner{outputs: map[string][]byte{
+		"pi auth":            []byte(`{"status":"ready","provider":"openai-codex"}`),
+		"pi --no-extensions": []byte("provider model context\nopenai-codex gpt-5.6-sol 272K\n"),
+	}, calls: &calls}
+	if err := Probe(context.Background(), f, piJob()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--list-models", "openai-codex"}
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1], want) {
+		t.Fatalf("model-list argv = %v, want %v", calls, want)
+	}
+	// The auth check must keep --no-refresh and precede the model query.
+	authWant := []string{"pi", "auth", "check", "--provider", "openai-codex", "--json", "--no-refresh"}
+	if !reflect.DeepEqual(calls[0], authWant) {
+		t.Fatalf("auth argv = %v, want %v", calls[0], authWant)
+	}
+}
+
+func TestProbePiSkipsModelListForHarnessDefault(t *testing.T) {
+	var calls [][]string
+	f := fakeRunner{outputs: map[string][]byte{
+		"pi auth": []byte(`{"status":"ready","provider":"openai-codex"}`),
+	}, calls: &calls}
+	job := piJob()
+	job.Execution.Model = "harness-default"
+	if err := Probe(context.Background(), f, job); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("model list must be skipped for harness-default: %v", calls)
+	}
+}
+
+func TestProbePiRefusesBadAuthWithoutListing(t *testing.T) {
+	for _, out := range []string{
+		`{"status":"expired","provider":"openai-codex"}`,
+		`{"status":"ready","provider":"other"}`,
+		`not json`,
+	} {
+		var calls [][]string
+		f := fakeRunner{outputs: map[string][]byte{
+			"pi auth": []byte(out),
+		}, calls: &calls}
+		if err := Probe(context.Background(), f, piJob()); err == nil {
+			t.Fatalf("auth output %q should fail closed", out)
+		}
+		if len(calls) != 1 {
+			t.Fatalf("no model list after bad auth %q: %v", out, calls)
+		}
+	}
+}
+
+func TestProbePiModelListFailureFailsClosed(t *testing.T) {
+	f := fakeRunner{outputs: map[string][]byte{
+		"pi auth": []byte(`{"status":"ready","provider":"openai-codex"}`),
+	}, fail: map[string]bool{"pi --no-extensions": true}}
+	err := Probe(context.Background(), f, piJob())
+	if err == nil || !contains(err.Error(), "cannot inspect pi models") {
+		t.Fatalf("model-list failure should fail closed, got %v", err)
 	}
 }
 

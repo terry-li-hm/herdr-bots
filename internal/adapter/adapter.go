@@ -44,6 +44,14 @@ type Launch struct {
 	Args []string
 }
 
+// The model-list query suppresses ambient extensions, skills, prompt
+// templates, and context discovery so probing cannot load workspace resources.
+// This restricts resource loading only; Pi itself still runs its normal
+// startup behavior.
+func piProbeModelListArgs(provider string) []string {
+	return []string{"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--list-models", provider}
+}
+
 func Probe(ctx context.Context, runner CommandRunner, job config.Job) error {
 	switch job.Execution.Harness {
 	case config.HarnessPi:
@@ -62,7 +70,7 @@ func Probe(ctx context.Context, runner CommandRunner, job config.Job) error {
 			return fmt.Errorf("route_unavailable: pi provider %q is not ready", job.Execution.Provider)
 		}
 		if job.Execution.Model != "harness-default" {
-			models, err := runner.Run(ctx, "pi", "--list-models", job.Execution.Provider)
+			models, err := runner.Run(ctx, "pi", piProbeModelListArgs(job.Execution.Provider)...)
 			if err != nil {
 				return fmt.Errorf("route_unavailable: cannot inspect pi models: %w", err)
 			}
