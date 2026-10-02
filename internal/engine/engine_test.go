@@ -51,7 +51,18 @@ func (f fakeCommands) Run(ctx context.Context, name string, args ...string) ([]b
 		}
 		return []byte(`{"status":"ready","provider":"openai-codex"}`), nil
 	}
-	if len(args) > 0 && args[0] == "--list-models" {
+	// The adapter probes models with a resource-suppressed query
+	// (--no-extensions --no-skills --no-prompt-templates
+	// --no-context-files --list-models PROVIDER). Accept exactly that
+	// six-entry argv in production order, with a nonempty provider; anything
+	// longer, shorter, or reordered is not what the adapter issues.
+	if len(args) == 6 &&
+		args[0] == "--no-extensions" &&
+		args[1] == "--no-skills" &&
+		args[2] == "--no-prompt-templates" &&
+		args[3] == "--no-context-files" &&
+		args[4] == "--list-models" &&
+		args[5] != "" {
 		return []byte(f.models), nil
 	}
 	return nil, errors.New("unexpected pi command")
@@ -449,6 +460,111 @@ func TestEvaluateRunsOneVerifiedOccurrence(t *testing.T) {
 	}
 	if strings.Contains(client.command, "edit,write") || strings.Contains(client.command, "bash") {
 		t.Fatalf("read-only route exposed write or shell: %q", client.command)
+	}
+}
+
+// The real adapter probe must succeed against this fake: the fake must
+// recognize the resource-suppressed --list-models argv the adapter actually
+// issues, and must still refuse commands it does not model.
+func TestProbeRecognizesSuppressedModelListQuery(t *testing.T) {
+	repo := t.TempDir()
+	cfg, err := config.Load(writeJobs(t, repo, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := fakeCommands{models: "provider model\nopenai-codex gpt-5.6-sol\n"}
+	if err := adapter.Probe(context.Background(), fake, cfg.Jobs[0]); err != nil {
+		t.Fatalf("probe failed against model-list fake: %v", err)
+	}
+	// An unsuppressed, reordered, provider-less, or extended model-list query
+	// is not what the adapter issues and must be rejected, as must any unknown
+	// pi invocation.
+	if _, err := fake.Run(context.Background(), "pi", "--list-models", "openai-codex"); err == nil {
+		t.Fatal("unsuppressed --list-models query was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--list-models"); err == nil {
+		t.Fatal("model-list query with no provider was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--list-models", "openai-codex", "--extra"); err == nil {
+		t.Fatal("model-list query with an unknown extra argument was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "pi", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--list-models", ""); err == nil {
+		t.Fatal("model-list query with an empty provider was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "pi", "--no-skills", "--no-extensions", "--no-prompt-templates", "--no-context-files", "--list-models", "openai-codex"); err == nil {
+		t.Fatal("model-list query with reordered suppression flags was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "pi", "chat"); err == nil {
+		t.Fatal("unexpected pi command was accepted")
+	}
+	if _, err := fake.Run(context.Background(), "vi"); err == nil {
+		t.Fatal("unexpected command was accepted")
+	}
+}
+
+// This synthetic no-verifier canary exercises admission for a job with no
+// verifier configured: the enabled case must admit and launch it without one,
+// and a disabled job must hold the canary blocked before any workspace is
+// provisioned. The temporary YAML keeps its default forbid overlap and no
+// sibling is ever queued.
+func TestEventCanaryAdmissionWithoutVerifier(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "enabled", enabled: true},
+		{name: "disabled", enabled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, state, client := newEventEngine(t, tc.enabled)
+			raw, err := os.ReadFile(eng.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const verifierBlock = "    verifier:\n      command: [\"/usr/bin/true\"]\n"
+			if !strings.Contains(string(raw), verifierBlock) {
+				t.Fatalf("config %q lacks the verifier block to remove", raw)
+			}
+			body := strings.Replace(string(raw), verifierBlock, "", 1)
+			if strings.Contains(body, "verifier:") {
+				t.Fatal("verifier was not fully removed")
+			}
+			if err := os.WriteFile(eng.ConfigPath, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			now := mustTime("2026-08-23T10:00:00+08:00")
+			result, err := eng.RunNow(context.Background(), "docs-drift", true, now)
+			if tc.enabled {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Trigger != "canary" {
+					t.Fatalf("canary=%+v", result)
+				}
+				finished := waitForRunTerminal(t, state, result.ID)
+				if finished.State != store.StateSucceeded || finished.AgentResult != "completed" ||
+					finished.TaskVerdict != "unverified" || finished.ExecutionMode != adapter.ModeCommand {
+					t.Fatalf("canary=%+v", finished)
+				}
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				if client.provisions != 1 {
+					t.Fatalf("provisions=%d", client.provisions)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("RunNow error=%v", err)
+				}
+				if result.State != store.StateBlocked || result.ErrorCode != "job_disabled" {
+					t.Fatalf("canary=%+v", result)
+				}
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				if client.provisions != 0 {
+					t.Fatalf("provisions=%d", client.provisions)
+				}
+			}
+		})
 	}
 }
 
