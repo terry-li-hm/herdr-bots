@@ -142,6 +142,76 @@ fi
 	}
 }
 
+// writeInventoryStub installs a printf-only fake herdr that answers every
+// invocation with the same payload, so inventory decoding can be observed in
+// isolation. No heredocs, no temporary files, no argument forwarding.
+func writeInventoryStub(t *testing.T, output string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "fake-herdr")
+	script := "#!/bin/sh\nprintf '%s\\n' " + "'" + strings.ReplaceAll(output, "'", `'\''`) + "'\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+func TestFindWorkspaceByBranchFailsClosedOnUnreadableInventory(t *testing.T) {
+	for name, output := range map[string]string{
+		"empty object":        `{}`,
+		"missing inventory":   `{"result":{}}`,
+		"null inventory":      `{"result":{"worktrees":null}}`,
+		"non-array inventory": `{"result":{"worktrees":{}}}`,
+		"null entry":          `{"result":{"worktrees":[null]}}`,
+		"missing branch":      `{"result":{"worktrees":[{"path":"/tmp/wt"}]}}`,
+		"non-string branch":   `{"result":{"worktrees":[{"branch":7,"path":"/tmp/wt"}]}}`,
+		"missing path":        `{"result":{"worktrees":[{"branch":"auto/job/planned"}]}}`,
+		"null path":           `{"result":{"worktrees":[{"branch":"auto/job/planned","path":null}]}}`,
+		"empty path":          `{"result":{"worktrees":[{"branch":"auto/job/planned","path":""}]}}`,
+		"non-string path":     `{"result":{"worktrees":[{"branch":"auto/job/planned","path":7}]}}`,
+		"non-object entry":    `{"result":{"worktrees":[7]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &CLI{Bin: writeInventoryStub(t, output)}
+			receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+			if err == nil || found {
+				t.Fatalf("receipt=%+v found=%t err=%v want a fail-closed decoding error", receipt, found, err)
+			}
+			if !strings.Contains(err.Error(), "worktree inventory") {
+				t.Fatalf("error=%v does not name the worktree inventory", err)
+			}
+		})
+	}
+}
+
+func TestFindWorkspaceByBranchAcceptsExplicitEmptyInventory(t *testing.T) {
+	client := &CLI{Bin: writeInventoryStub(t, `{"result":{"worktrees":[]}}`)}
+	receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+	if err != nil || found || receipt.WorkspaceID != "" || receipt.Path != "" {
+		t.Fatalf("receipt=%+v found=%t err=%v want verified absence", receipt, found, err)
+	}
+}
+
+func TestFindWorkspaceByBranchAcceptsDetachedWorktreeEntries(t *testing.T) {
+	// A detached worktree carries an explicit branch:null. It is legitimate
+	// inventory, must not fail decoding, and never matches a named branch.
+	client := &CLI{Bin: writeInventoryStub(t, `{"result":{"worktrees":[{"branch":null,"path":"/tmp/detached"}]}}`)}
+	receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+	if err != nil || found || receipt.WorkspaceID != "" || receipt.Path != "" {
+		t.Fatalf("receipt=%+v found=%t err=%v want verified absence past a detached entry", receipt, found, err)
+	}
+}
+
+func TestFindWorkspaceByBranchMatchesNamedEntryAlongsideDetachedOnes(t *testing.T) {
+	// The detached entry must neither fail decoding nor shadow the named
+	// match later in the same inventory.
+	output := `{"result":{"worktrees":[{"branch":null,"path":"/tmp/detached"},{"branch":"auto/job/planned","path":"/tmp/planned"}]}}`
+	client := &CLI{Bin: writeInventoryStub(t, output)}
+	receipt, found, err := client.FindWorkspaceByBranch(context.Background(), "/repo", "auto/job/planned")
+	if err != nil || !found || receipt.WorkspaceID != "" || receipt.Path != "/tmp/planned" {
+		t.Fatalf("receipt=%+v found=%t err=%v want the named worktree as unowned evidence", receipt, found, err)
+	}
+}
+
 func TestShellQuoteKeepsACompoundCommandInOneArgument(t *testing.T) {
 	got := shellQuote("claude -p 'prompt'; printf done")
 	want := `'claude -p '\''prompt'\''; printf done'`

@@ -39,6 +39,7 @@ launchd supervises the scheduler process. Herdr does not.
 | `run JOB --canary` | Execute one attended canary |
 | `enqueue JOB --event-id ID` | Accept one typed local event occurrence |
 | `cancel RUN` | Close a received Herdr workspace and mark the run cancelled |
+| `recover RUN` | Retire one expired provisioning claim as interrupted after verifying workspace absence, without dispatch |
 | `pause` / `resume` | Change a job or global execution pause |
 | `doctor` | Validate configuration, repositories, and exact harness routes |
 | `service render` | Print the launchd plist without installing it |

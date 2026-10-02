@@ -120,20 +120,93 @@ func (c *CLI) WorkspaceExists(ctx context.Context, workspaceID string) (bool, er
 	return true, nil
 }
 
-func (c *CLI) FindWorkspaceByBranch(ctx context.Context, repo, branch string) (Receipt, bool, error) {
-	var worktreeResult struct {
-		Worktrees []struct {
-			Branch string `json:"branch"`
-			Path   string `json:"path"`
-		} `json:"worktrees"`
+// worktreeInventoryEntry is one strictly decoded worktree list row. A nil
+// branch is a legitimate detached worktree (explicit JSON null), never a
+// missing key: a row whose branch is absent is refused because its meaning
+// is unknown.
+type worktreeInventoryEntry struct {
+	branch *string
+	path   string
+}
+
+// decodeWorktreeInventory decodes a worktree list inventory strictly, because
+// this inventory is an absence proof for workspace recovery. The array must be
+// explicitly present and non-null: a missing or null inventory must never read
+// as an empty one, and a skipped or half-decoded row must never silently
+// disappear from the match. Every entry must carry an explicit branch (a
+// string, or null for a detached worktree) and a nonempty string path; wrong
+// types fail closed instead of decoding into zero values.
+func decodeWorktreeInventory(raw json.RawMessage) ([]worktreeInventoryEntry, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("worktrees array is missing")
 	}
-	if err := c.run(ctx, &worktreeResult, "worktree", "list", "--cwd", repo); err != nil {
+	if isJSONNull(raw) {
+		return nil, errors.New("worktrees array is null")
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, fmt.Errorf("worktrees is not an array: %w", err)
+	}
+	entries := make([]worktreeInventoryEntry, 0, len(rows))
+	for i, row := range rows {
+		if isJSONNull(row) {
+			return nil, fmt.Errorf("worktrees[%d] is null", i)
+		}
+		var fields struct {
+			Branch json.RawMessage `json:"branch"`
+			Path   json.RawMessage `json:"path"`
+		}
+		if err := json.Unmarshal(row, &fields); err != nil {
+			return nil, fmt.Errorf("worktrees[%d] is not an object: %w", i, err)
+		}
+		var branch *string
+		switch {
+		case len(fields.Branch) == 0:
+			return nil, fmt.Errorf("worktrees[%d] has no branch", i)
+		case !isJSONNull(fields.Branch):
+			var name string
+			if err := json.Unmarshal(fields.Branch, &name); err != nil {
+				return nil, fmt.Errorf("worktrees[%d] has a non-string branch: %w", i, err)
+			}
+			branch = &name
+		}
+		if len(fields.Path) == 0 {
+			return nil, fmt.Errorf("worktrees[%d] has no path", i)
+		}
+		if isJSONNull(fields.Path) {
+			return nil, fmt.Errorf("worktrees[%d] has a null path", i)
+		}
+		var path string
+		if err := json.Unmarshal(fields.Path, &path); err != nil {
+			return nil, fmt.Errorf("worktrees[%d] has a non-string path: %w", i, err)
+		}
+		if path == "" {
+			return nil, fmt.Errorf("worktrees[%d] has an empty path", i)
+		}
+		entries = append(entries, worktreeInventoryEntry{branch: branch, path: path})
+	}
+	return entries, nil
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func (c *CLI) FindWorkspaceByBranch(ctx context.Context, repo, branch string) (Receipt, bool, error) {
+	var inventory struct {
+		Worktrees json.RawMessage `json:"worktrees"`
+	}
+	if err := c.run(ctx, &inventory, "worktree", "list", "--cwd", repo); err != nil {
 		return Receipt{}, false, err
 	}
+	worktrees, err := decodeWorktreeInventory(inventory.Worktrees)
+	if err != nil {
+		return Receipt{}, false, fmt.Errorf("worktree inventory: %w", err)
+	}
 	path := ""
-	for _, worktree := range worktreeResult.Worktrees {
-		if worktree.Branch == branch {
-			path = worktree.Path
+	for _, worktree := range worktrees {
+		if worktree.branch != nil && *worktree.branch == branch {
+			path = worktree.path
 			break
 		}
 	}

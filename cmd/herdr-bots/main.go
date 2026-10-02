@@ -55,6 +55,8 @@ func run(args []string) error {
 		return enqueueCmd(args[1:])
 	case "cancel":
 		return cancelCmd(args[1:])
+	case "recover":
+		return recoverCmd(args[1:])
 	case "pause":
 		return pauseCmd(args[1:], true)
 	case "resume":
@@ -126,13 +128,18 @@ Usage:
   herdr-bots run JOB [--config PATH] [--state PATH] [--canary]
   herdr-bots enqueue JOB --event-id ID [--config PATH] [--state PATH]
   herdr-bots cancel RUN [--config PATH] [--state PATH]
+  herdr-bots recover RUN [--config PATH] [--state PATH]
   herdr-bots pause JOB|--all [--state PATH]
   herdr-bots resume JOB|--all [--state PATH]
   herdr-bots doctor [--config PATH] [--state PATH]
   herdr-bots service render [--config PATH] [--state PATH]
 
 Service rendering is read-only. Installing, loading, or changing a launchd
-service remains a separate explicit action.`)
+service remains a separate explicit action.
+
+Recover is an explicit, owner-directed retirement of one stuck provisioning
+run after verified workspace absence. It is not daemon reconciliation and
+never schedules, dispatches, provisions, or closes workspaces.`)
 }
 
 func common(fs *flag.FlagSet) (*string, *string) {

@@ -189,6 +189,7 @@ herdr-bots enqueue JOB --event-id ID
 herdr-bots pause JOB|--all
 herdr-bots resume JOB|--all
 herdr-bots cancel RUN
+herdr-bots recover RUN
 herdr-bots doctor
 herdr-bots service render
 ```
@@ -228,6 +229,14 @@ operator supplies `--canary`.
   cancelled.
 - Marking runs read (via `show` or the pane) never resumes a paused job;
   explicit `herdr-bots resume JOB` is always required.
+
+## Recover one expired provisioning run
+
+`herdr-bots recover RUN --state PATH` is an explicit, single-run operation. It accepts only expired or legacy unowned provisioning claims with no saved workspace, pane, worktree or external-effect receipt. It requires a valid saved worktree job, a planned branch and a successful Herdr inventory lookup proving that no matching workspace or worktree exists. An unavailable server, any matching worktree or a concurrent state change makes recovery fail closed.
+
+Recovery records the run as `interrupted` with an explicit recovery event. It does not claim successful work or cancellation. Terminal states stay immutable. The database transition is bound to the row observed before the inventory lookup, so claim renewal or receipt changes cannot be overwritten.
+
+This command never evaluates schedules, dispatches work, probes model authentication, creates or closes a workspace, or resumes a job. It keeps the existing cancellation guards and daemon transition logic. Shared worktree inventory parsing now rejects missing, null or incomplete inventories. Obtain approval for the exact run before invoking it. Starting Herdr remains a separate action because it can restore saved agents and execute plugin hooks.
 
 ## Unread-work guard (opt-in)
 
